@@ -1,0 +1,131 @@
+# LiDAR to 2DGS Converter Configuration
+# Commercial-grade settings for production use
+
+version: "1.0.0"
+
+# ============================================================================
+# INPUT SETTINGS
+# ============================================================================
+input:
+  # Auto-detect format or specify: txt, las, laz
+  format: "auto"
+  # Coordinate system: "ENU" (East-North-Up), "NED", "WGS84"
+  coordinate_system: "ENU"
+  # Scale factor for coordinates (e.g., 1000 for mm to m)
+  scale_factor: 1.0
+
+# ============================================================================
+# PREPROCESSING SETTINGS
+# ============================================================================
+preprocess:
+  enabled: true
+  # Voxel downsampling (0 to disable)
+  voxel_size: 0.0
+  # Statistical outlier removal
+  outlier_removal:
+    enabled: true
+    k_neighbors: 20
+    std_multiplier: 2.0
+  # Ground plane removal (for terrestrial LiDAR)
+  ground_removal:
+    enabled: false
+    method: "ransac"  # "ransac", "height", " Cloth Simulation"
+    max_height: 0.5
+
+# ============================================================================
+# NORMAL ESTIMATION SETTINGS
+# ============================================================================
+normals:
+  # Number of neighbors for PCA
+  k_neighbors: 20
+  # Up vector for orientation (ENU: z-up)
+  up_vector: [0, 0, 1]
+  # Method: "pca", "knn", "hoppe"
+  method: "pca"
+  # GPU acceleration (requires CUDA)
+  use_gpu: false
+  # Uncertainty quantification
+  uncertainty:
+    enabled: false
+    max_threshold: 0.5
+
+# ============================================================================
+# SURFEL CONSTRUCTION SETTINGS
+# ============================================================================
+surfels:
+  # Gaussian spread along tangent plane (meters)
+  sigma_tangent: 0.05
+  # Gaussian thickness along normal (meters)
+  sigma_normal: 0.002
+  # Default opacity for all surfels
+  opacity: 0.8
+  # Minimum distance between surfels (for decimation)
+  min_distance: 0.0
+
+# ============================================================================
+# PRUNING SETTINGS
+# ============================================================================
+pruning:
+  enabled: false
+  # Minimum planarity score (0-1)
+  min_planarity: 0.4
+  # Minimum opacity
+  min_opacity: 0.01
+  # Maximum normal variance
+  max_normal_variance: 0.001
+  # Maximum uncertainty
+  max_uncertainty: 0.5
+
+# ============================================================================
+# OUTPUT SETTINGS
+# ============================================================================
+output:
+  # Format: "standard" (rotation+scale), "covariance"
+  format: "standard"
+  # File format: "ply", "npz"
+  file_format: "ply"
+  # Binary output (smaller, faster)
+  binary: true
+  # Compression for NPZ output
+  compress: true
+
+# ============================================================================
+# PERFORMANCE SETTINGS
+# ============================================================================
+performance:
+  # Number of parallel workers (-1 for all cores)
+  n_workers: -1
+  # Chunk size for streaming processing
+  chunk_size: 50000
+  # Memory limit in GB (0 for unlimited)
+  memory_limit: 0
+  # Use memory-mapped files for large datasets
+  use_mmap: false
+
+# ============================================================================
+# RERUN VIEWER SETTINGS
+# ============================================================================
+viewer:
+  # Default visualization mode: "points", "ellipsoids", "detailed"
+  default_mode: "detailed"
+  # Point size
+  point_size: 0.02
+  # Background color (RGB)
+  background_color: [18, 18, 26]
+  # Show coordinate axes
+  show_axes: true
+  # Show bounding box
+  show_bbox: false
+  # Anti-aliasing
+  anti_aliasing: true
+
+# ============================================================================
+# LOGGING SETTINGS
+# ============================================================================
+logging:
+  # Level: "DEBUG", "INFO", "WARNING", "ERROR"
+  level: "INFO"
+  # Log file path (empty for no file logging)
+  log_file: ""
+  # Log format
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

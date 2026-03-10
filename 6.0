@@ -1,0 +1,13 @@
+Collecting rich
+  Downloading rich-14.3.2-py3-none-any.whl.metadata (18 kB)
+Requirement already satisfied: pyyaml in c:\users\65889\desktop\nus\softwares\python\lib\site-packages (6.0.3)
+Collecting markdown-it-py>=2.2.0 (from rich)
+  Downloading markdown_it_py-4.0.0-py3-none-any.whl.metadata (7.3 kB)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in c:\users\65889\appdata\roaming\python\python312\site-packages (from rich) (2.18.0)
+Collecting mdurl~=0.1 (from markdown-it-py>=2.2.0->rich)
+  Downloading mdurl-0.1.2-py3-none-any.whl.metadata (1.6 kB)
+Downloading rich-14.3.2-py3-none-any.whl (309 kB)
+Downloading markdown_it_py-4.0.0-py3-none-any.whl (87 kB)
+Downloading mdurl-0.1.2-py3-none-any.whl (10.0 kB)
+Installing collected packages: mdurl, markdown-it-py, rich
+Successfully installed markdown-it-py-4.0.0 mdurl-0.1.2 rich-14.3.2
