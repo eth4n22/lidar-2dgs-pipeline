@@ -41,11 +41,12 @@ from src.octree_io import is_octree_directory, convert_ply_to_octree, OctreeView
 
 
 class SurfelViewer:
-    def __init__(self, filepath: str, original_txt_path: str = None, force_ply: bool = False, distance_threshold: float = 2.0):
+    def __init__(self, filepath: str, original_txt_path: str = None, force_ply: bool = False, distance_threshold: float = 2.0, view_mode: str = "octree"):
         self.filepath = filepath
         self.original_txt_path = original_txt_path
         self.force_ply = force_ply  # If True, skip all octree logic
         self.distance_threshold = distance_threshold
+        self.view_mode = view_mode  # "ply", "octree", or "hierarchical"
         self.show_axis = True
         self.show_surfels = True
         self.coord = None
@@ -763,35 +764,64 @@ def main():
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug output")
     parser.add_argument("--help-all", action="store_true", help="Show full help")
+    parser.add_argument("--mode", dest="view_mode", 
+                        choices=["ply", "octree", "hierarchical"],
+                        default=None,
+                        help="Viewing mode: 'ply' (direct PLY), 'octree' (distance-based chunk loading), 'hierarchical' (LOD-based progressive loading)")
     
     args = parser.parse_args()
     
     # Determine file path - use global project root
     script_dir = _pc2dgs_dir
     
+    # Check args.view_mode for viewing mode
+    view_mode = args.view_mode
+    
     # Check if path is to a .2dgs_octree directory
     input_path = Path(args.file) if args.file else None
     if input_path and input_path.is_dir() and str(input_path).endswith('.2dgs_octree'):
         # Already an octree directory - use it directly
         filepath = str(input_path)
+        # Determine mode if not specified
+        if view_mode is None:
+            view_mode = "octree"  # Default for octree directory
     elif input_path and input_path.suffix == '.ply':
-        # User selected a PLY file - check if octree version exists
-        if not args.force_ply:
+        # User selected a PLY file
+        # Determine default mode based on whether octree exists
+        if view_mode is None:
+            octree_path = input_path.with_suffix('.2dgs_octree')
+            if octree_path.exists() and list(octree_path.glob("chunk_*.bin")):
+                view_mode = "octree"  # Default to octree if available
+            else:
+                view_mode = "ply"  # Fall back to PLY
+        
+        # Handle each mode
+        if view_mode == "ply":
+            # Force PLY loading
+            filepath = str(input_path)
+            print(f"Loading original PLY directly: {filepath}")
+        elif view_mode in ("octree", "hierarchical"):
+            # Check for octree version
             octree_path = input_path.with_suffix('.2dgs_octree')
             if octree_path.exists():
                 chunk_files = list(octree_path.glob("chunk_*.bin"))
                 if chunk_files:
-                    print(f"Found .2dgs_octree version! Viewing octree (streaming mode)...")
-                    viewer = SurfelViewer(str(octree_path), args.txt_file, args.force_ply, args.distance_threshold)
+                    if view_mode == "hierarchical":
+                        print(f"Found .2dgs_octree version! Viewing in hierarchical mode...")
+                    else:
+                        print(f"Found .2dgs_octree version! Viewing octree (streaming mode)...")
+                    viewer = SurfelViewer(str(octree_path), args.txt_file, args.force_ply, args.distance_threshold, 
+                                          view_mode=view_mode)
                     viewer.run()
                     return
-        # Load PLY directly
-        filepath = str(input_path)
-        if args.force_ply:
-            print(f"Loading original PLY (octree disabled): {filepath}")
+            # No octree available - fall back to PLY
+            filepath = str(input_path)
+            print(f"No octree found, loading PLY directly: {filepath}")
     else:
         # Default to output.ply
         filepath = str(script_dir / "data" / "output" / "output.ply")
+        if view_mode is None:
+            view_mode = "ply"
     
     # Check if file exists
     if not os.path.exists(filepath):
