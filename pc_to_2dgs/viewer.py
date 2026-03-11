@@ -48,71 +48,64 @@ class SurfelViewer:
             self._init_ply_viewer(input_path, original_txt_path)
     
     def _init_streaming_viewer(self, octree_dir: str):
-        """Initialize streaming viewer for .2dgs_octree format - loads ALL chunks without truncation."""
+        """Initialize streaming viewer for .2dgs_octree format with camera-based chunk loading."""
         import numpy as np
         from pathlib import Path
         
         self.is_streaming = True
         
-        # Get all chunk files directly
-        octree_path = Path(octree_dir)
-        chunk_files = sorted(octree_path.glob("chunk_*.bin"))
+        # Use OctreeViewer for proper streaming
+        self.octree_viewer = OctreeViewer(octree_dir, cache_size=100)
         
-        if not chunk_files:
-            print("ERROR: No chunk files found!")
-            return
+        # Get all chunk node IDs
+        all_nodes = self.octree_viewer.get_all_chunk_nodes()
+        total_chunks = len(all_nodes)
+        total_surfels = self.octree_viewer.metadata.num_surfels
         
-        total_chunks = len(chunk_files)
-        print(f"Found {total_chunks} chunks in octree")
+        import sys
+        print(f"Octree streaming ready:", file=sys.stderr)
+        print(f"  Total chunks: {total_chunks}", file=sys.stderr)
+        print(f"  Total surfels: {total_surfels:,}", file=sys.stderr)
+        print(f"  Cache size: {self.octree_viewer.cache_size}", file=sys.stderr)
+        sys.stderr.flush()
         
-        # Load ALL chunks using lightweight mode (only position + color)
-        # This uses ~75% less memory than loading full surfel data
-        BATCH_SIZE = 50
+        # Track loaded chunks for logging
+        self._loaded_chunk_ids = set()
+        self._total_visible_surfels = 0
         
-        all_positions = []
-        all_colors = []
+        # Initial load - get root-level chunks (top of octree)
+        # These are the largest chunks covering the whole scene
+        root_chunks = []
+        for node in self.octree_viewer.root_node.children:
+            if node.chunk_file:
+                root_chunks.append(node.node_id)
         
-        print(f"Loading ALL {total_chunks} chunks with lightweight mode...")
+        print(f"  Root chunks: {len(root_chunks)}", file=sys.stderr)
+        sys.stderr.flush()
         
-        for batch_start in range(0, total_chunks, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total_chunks)
-            batch_files = chunk_files[batch_start:batch_end]
-            
-            for chunk_file in batch_files:
-                surfels = load_chunk_lightweight(str(chunk_file))
-                if surfels is not None and len(surfels.get('position', [])) > 0:
-                    all_positions.append(surfels['position'])
-                    all_colors.append(surfels['color'])
-            
-            loaded = batch_end
-            print(f"  Loaded {loaded}/{total_chunks} chunks ({loaded * 100 // total_chunks}%)")
+        # Load initial set of chunks
+        initial_chunks = root_chunks[:min(50, len(root_chunks))]
+        if initial_chunks:
+            self._load_chunks_streaming(initial_chunks)
         
-        if not all_positions:
-            print("ERROR: No surfels loaded!")
-            return
+        # Get bounding box for camera
+        bbox = self.octree_viewer.get_bounding_box()
+        if bbox:
+            center = np.array([
+                (bbox['min'][0] + bbox['max'][0]) / 2,
+                (bbox['min'][1] + bbox['max'][1]) / 2,
+                (bbox['min'][2] + bbox['max'][2]) / 2
+            ])
+        else:
+            center = np.array([0, 0, 0])
         
-        # Combine all batches
-        positions = np.vstack(all_positions)
-        colors = np.vstack(all_colors)
+        self._octree_center = center
+        self._all_chunk_nodes = all_nodes
+        self._all_chunk_ids = all_nodes  # For status logging
+        self._chunk_bounds = {}
         
-        del all_positions, all_colors
-        
-        n_points = len(positions)
-        print(f"Total: {n_points:,} surfels loaded from all {total_chunks} chunks")
-        
-        # Create point cloud
-        import numpy as np
-        self.surfel_pcd = o3d.geometry.PointCloud()
-        self.surfel_pcd.points = o3d.utility.Vector3dVector(positions.astype(np.float32))
-        self.surfel_pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float32))
-        
-        # Center the data
-        center = self.surfel_pcd.get_center()
-        self.surfel_pcd = self.surfel_pcd.translate(-center)
-        
-        # Get bounding box
-        bbox = self.surfel_pcd.get_axis_aligned_bounding_box()
-        print(f"Bounding box: {bbox.get_print_info()}")
+        # Pre-compute chunk bounds from hierarchy
+        self._compute_chunk_bounds()
         
         # Create coordinate frame
         self.coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
@@ -141,16 +134,181 @@ class SurfelViewer:
         self.vis.register_key_callback(ord('a'), self.toggle_axis)
         self.vis.register_key_callback(ord('R'), self.reload_chunks)
         self.vis.register_key_callback(ord('r'), self.reload_chunks)
+        self.vis.register_key_callback(ord('L'), self.log_chunk_status)
+        self.vis.register_key_callback(ord('l'), self.log_chunk_status)
         self.vis.register_key_callback(ord('Q'), self.quit)
         self.vis.register_key_callback(ord('q'), self.quit)
     
-    def reload_chunks(self, vis):
-        """Reload chunks (for streaming mode)."""
+    def log_chunk_status(self, vis):
+        """Log current chunk streaming status."""
+        import sys
         if not self.is_streaming:
+            print("Not in streaming mode", file=sys.stderr)
+            sys.stderr.flush()
             return
         
-        # All chunks are already loaded at initialization
-        print("All chunks already loaded - no need to reload")
+        print("\n" + "="*50, file=sys.stderr)
+        print("CHUNK STREAMING STATUS", file=sys.stderr)
+        print("="*50, file=sys.stderr)
+        print(f"Total chunks in octree: {len(self._all_chunk_ids)}", file=sys.stderr)
+        print(f"Currently loaded: {len(self._loaded_chunk_ids)}", file=sys.stderr)
+        print(f"Total visible surfels: {self._total_visible_surfels:,}", file=sys.stderr)
+        print(f"Cache size: {self.octree_viewer.cache_size}", file=sys.stderr)
+        
+        # Get camera info
+        cam = self.vis.get_view_control()
+        lookat = cam.get_lookat()
+        front = cam.get_front()
+        print(f"Camera lookat: {lookat}", file=sys.stderr)
+        print(f"Camera front: {front}", file=sys.stderr)
+        print("="*50 + "\n", file=sys.stderr)
+        sys.stderr.flush()
+    
+    def reload_chunks(self, vis):
+        """Reload chunks based on current camera position."""
+        if not self.is_streaming or not hasattr(self, 'octree_viewer'):
+            return
+        
+        # Update visible chunks based on camera
+        self._update_visible_chunks()
+    
+    def _compute_chunk_bounds(self):
+        """Pre-compute bounding boxes for each chunk."""
+        import numpy as np
+        import sys
+        
+        # Use hierarchy bounds if available
+        if hasattr(self.octree_viewer, 'root_node') and self.octree_viewer.root_node:
+            def traverse(node, depth=0):
+                if node.chunk_file and node.bounds:
+                    self._chunk_bounds[node.node_id] = node.bounds
+                for child in node.children:
+                    traverse(child, depth+1)
+            traverse(self.octree_viewer.root_node)
+        
+        # If no bounds from hierarchy, estimate from chunk data
+        if not self._chunk_bounds:
+            print("  Warning: No chunk bounds in hierarchy, loading sample chunks...", file=sys.stderr)
+            sample_nodes = self._all_chunk_nodes[:10]
+            for node_id in sample_nodes:
+                surfels = self.octree_viewer.get_chunk(node_id)
+                if surfels is not None and len(surfels.get('position', [])) > 0:
+                    pos = surfels['position']
+                    self._chunk_bounds[node_id] = (
+                        pos[:,0].min(), pos[:,1].min(), pos[:,2].min(),
+                        pos[:,0].max(), pos[:,1].max(), pos[:,2].max()
+                    )
+            sys.stderr.flush()
+    
+    def _load_chunks_streaming(self, node_ids: list):
+        """Load chunks and create point cloud geometry."""
+        import numpy as np
+        import sys
+        
+        # Load chunks with lightweight mode
+        surfels = self.octree_viewer.load_chunks_lightweight(node_ids)
+        if surfels is None:
+            return
+        
+        positions = surfels['position']
+        colors = surfels['color']
+        
+        # Translate to center
+        positions = positions - self._octree_center
+        
+        # Create point cloud
+        self.surfel_pcd = o3d.geometry.PointCloud()
+        self.surfel_pcd.points = o3d.utility.Vector3dVector(positions.astype(np.float32))
+        self.surfel_pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float32))
+        
+        # Track loaded chunks
+        self._loaded_chunk_ids = set(node_ids)
+        self._total_visible_surfels = len(positions)
+        
+        print(f"  Loaded {len(node_ids)} chunks, {len(positions):,} surfels", file=sys.stderr)
+        sys.stderr.flush()
+    
+    def _update_visible_chunks(self):
+        """Update which chunks are loaded based on camera position."""
+        import numpy as np
+        import sys
+        
+        cam = self.vis.get_view_control()
+        lookat = cam.get_lookat()
+        camera_pos = np.array(lookat)  # This is actually the lookat point
+        
+        # Get camera position from the camera object
+        # Open3D's get_view_control doesn't directly give camera position
+        # We use lookat + a offset based on front vector
+        front = np.array(cam.get_front())
+        # Estimate camera is behind the lookat point
+        # For now, use lookat as approximate camera position
+        
+        view_dist = 10.0  # Assume ~10 units view distance
+        camera_pos = np.array(lookat) - front * view_dist
+        
+        print(f"\n=== Chunk Selection Update ===", file=sys.stderr)
+        print(f"Camera position: {camera_pos}", file=sys.stderr)
+        print(f"Lookat: {lookat}", file=sys.stderr)
+        
+        # Find chunks within view distance
+        max_view_dist = 20.0  # Load chunks within 20 units
+        visible_nodes = []
+        
+        for node_id in self._all_chunk_nodes:
+            bounds = self._chunk_bounds.get(node_id)
+            if bounds is None:
+                # No bounds, include it
+                visible_nodes.append(node_id)
+                continue
+            
+            # Check if chunk center is within view distance
+            center_x = (bounds[0] + bounds[3]) / 2
+            center_y = (bounds[1] + bounds[4]) / 2
+            center_z = (bounds[2] + bounds[5]) / 2
+            chunk_center = np.array([center_x, center_y, center_z])
+            
+            dist = np.linalg.norm(chunk_center - camera_pos)
+            if dist < max_view_dist:
+                visible_nodes.append(node_id)
+        
+        # Limit to cache size
+        cache_size = self.octree_viewer.cache_size
+        if len(visible_nodes) > cache_size:
+            # Sort by distance and take closest
+            visible_nodes.sort(key=lambda nid: self._get_chunk_distance(nid, camera_pos))
+            visible_nodes = visible_nodes[:cache_size]
+        
+        # Determine what to load/unload
+        new_chunks = set(visible_nodes) - self._loaded_chunk_ids
+        old_chunks = self._loaded_chunk_ids - set(visible_nodes)
+        
+        print(f"Currently loaded: {len(self._loaded_chunk_ids)} chunks", file=sys.stderr)
+        print(f"Visible: {len(visible_nodes)} chunks", file=sys.stderr)
+        print(f"Chunks to LOAD: {len(new_chunks)}", file=sys.stderr)
+        print(f"Chunks to UNLOAD: {len(old_chunks)}", file=sys.stderr)
+        
+        if new_chunks or old_chunks:
+            # Reload visible chunks
+            self._load_chunks_streaming(visible_nodes)
+        
+        print(f"Total visible surfels: {self._total_visible_surfels:,}", file=sys.stderr)
+        print(f"================================\n", file=sys.stderr)
+        sys.stderr.flush()
+    
+    def _get_chunk_distance(self, node_id: str, camera_pos: np.ndarray) -> float:
+        """Get distance from camera to chunk center."""
+        import numpy as np
+        bounds = self._chunk_bounds.get(node_id)
+        if bounds is None:
+            return float('inf')
+        
+        center = np.array([
+            (bounds[0] + bounds[3]) / 2,
+            (bounds[1] + bounds[4]) / 2,
+            (bounds[2] + bounds[5]) / 2
+        ])
+        return np.linalg.norm(center - camera_pos)
     
     def _init_ply_viewer(self, ply_path: str, original_txt_path: str = None):
         """Initialize regular PLY viewer."""
@@ -256,7 +414,7 @@ class SurfelViewer:
         if self.is_streaming:
             print("\nControls (Streaming Mode):")
             print("  Left-drag: Rotate | Scroll: Zoom")
-            print("  A: Toggle axis | R: Reload chunks | Q: Quit")
+            print("  A: Toggle axis | R: Reload chunks | L: Log status | Q: Quit")
         else:
             print("\nControls:")
             print("  Left-drag: Rotate | Scroll: Zoom")

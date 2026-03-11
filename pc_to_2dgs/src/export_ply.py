@@ -5,7 +5,7 @@ Export Gaussian surfels to PLY format for 3DGS/2DGS rendering.
 """
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Generator, List, Tuple
 import numpy as np
 import struct
 
@@ -369,6 +369,160 @@ def read_ply(filepath: str, max_memory_gb: float = 4.0, start_idx: int = 0,
     print(f"  Read {n_surfels} surfels from {filepath} ({format_type})")
     
     return surfels
+
+
+def stream_ply_chunks(filepath: str, chunk_size: int = 100000, 
+                      verbose: bool = True) -> Generator[Dict[str, np.ndarray], None, None]:
+    """
+    Stream surfel data from a PLY file in chunks.
+    
+    This is a memory-efficient generator that yields chunks of surfels
+    without loading the entire file into RAM. Ideal for processing
+    very large point clouds (>1M points).
+    
+    Args:
+        filepath: Path to input PLY file (binary format recommended)
+        chunk_size: Number of points per chunk (default: 100k)
+        verbose: Print progress messages
+        
+    Yields:
+        Dictionary of surfel attributes for each chunk:
+            - position: (N, 3) xyz coordinates
+            - normal: (N, 3) surface normals
+            - tangent: (N, 3) tangent vectors
+            - bitangent: (N, 3) bitangent vectors
+            - opacity: (N,) opacity values
+            - scale: (N, 3) scale parameters
+            - rotation: (N, 4) quaternion [x, y, z, w]
+            - color: (N, 3) rgb values (0-1)
+    
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If PLY format is invalid or not binary
+        
+    Example:
+        # Process a large PLY file in chunks
+        for chunk in stream_ply_chunks('large_file.ply', chunk_size=50000):
+            # Process chunk - e.g., convert to octree
+            process_chunk(chunk)
+            # Chunk is automatically freed after processing
+    """
+    import gc
+    
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"PLY file not found: {filepath}")
+    
+    # Read header to get metadata
+    with open(path, 'rb') as f:
+        header_raw = f.read(2048)
+    
+    try:
+        header_str = header_raw.decode('ascii')
+    except:
+        header_str = header_raw.decode('utf-8', errors='replace')
+    
+    lines = header_str.split('\n')
+    
+    # Parse header
+    is_binary = False
+    n_surfels = 0
+    n_props = 0
+    header_size = 0
+    
+    for i, line in enumerate(lines):
+        if line.startswith("format"):
+            is_binary = "binary" in line.lower()
+        elif line.startswith("element vertex"):
+            n_surfels = int(line.split()[-1])
+        elif line.startswith("property"):
+            n_props += 1
+        elif line.strip() == "end_header":
+            with open(path, 'rb') as f:
+                marker = b"end_header"
+                marker_len = len(marker)
+                while True:
+                    chunk_data = f.read(4096)
+                    if not chunk_data:
+                        break
+                    idx = chunk_data.find(marker)
+                    if idx != -1:
+                        header_size += idx + marker_len + 1
+                        break
+                    header_size += len(chunk_data)
+            break
+    
+    if not is_binary:
+        raise ValueError("Streaming only supports binary PLY files. Use --binary when exporting.")
+    
+    if n_surfels == 0:
+        raise ValueError("No vertices found in PLY file")
+    
+    if verbose:
+        print(f"  Streaming {n_surfels:,} points in chunks of {chunk_size:,}")
+    
+    bytes_per_point = n_props * 4
+    
+    # Property mapping (same as read_ply)
+    prop_map = {
+        0: ("position", 3),
+        3: ("normal", 3),
+        6: ("tangent", 3),
+        9: ("bitangent", 3),
+        12: ("opacity", 1),
+        13: ("scale", 3),
+        16: ("rotation", 4),
+        20: ("color", 3),
+    }
+    
+    # Stream through file in chunks
+    points_read = 0
+    chunk_idx = 0
+    
+    with open(path, 'rb') as f:
+        f.seek(header_size)
+        
+        while points_read < n_surfels:
+            # Calculate how many points to read this iteration
+            remaining = n_surfels - points_read
+            current_chunk_size = min(chunk_size, remaining)
+            
+            # Read chunk data
+            data_size = current_chunk_size * bytes_per_point
+            chunk_data = f.read(data_size)
+            
+            if not chunk_data or len(chunk_data) < data_size:
+                break
+            
+            # Parse chunk into numpy array
+            vertex_data = np.frombuffer(chunk_data, dtype=np.float32).reshape(-1, n_props)
+            
+            # Convert to surfel dictionary
+            surfels = {}
+            for start_idx, (prop_name, count) in prop_map.items():
+                end_idx = start_idx + count
+                if end_idx <= vertex_data.shape[1]:
+                    data = vertex_data[:, start_idx:end_idx]
+                    if count == 1:
+                        data = data.flatten()
+                    surfels[prop_name] = data
+            
+            if verbose:
+                print(f"    Chunk {chunk_idx}: yielded {len(surfels.get('position', [])):,} points")
+            
+            yield surfels
+            
+            # Clear references and force garbage collection
+            del vertex_data
+            del surfels
+            del chunk_data
+            gc.collect()
+            
+            points_read += current_chunk_size
+            chunk_idx += 1
+    
+    if verbose:
+        print(f"  Finished streaming {points_read:,} points in {chunk_idx} chunks")
 
 
 def ply_header_from_surfels(n_surfels: int, binary: bool = False) -> str:

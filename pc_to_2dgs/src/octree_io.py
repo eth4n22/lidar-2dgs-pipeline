@@ -416,17 +416,19 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
     This enables viewing files larger than available RAM by loading
     only visible chunks on demand.
     
+    Uses streaming PLY reader to avoid loading entire file into RAM.
+    
     Args:
         ply_path: Path to input PLY file
         output_dir: Output directory (default: <ply_path>.2dgs_octree)
-        chunk_size: Points per chunk (default: 100k)
+        chunk_size: Points per chunk for spatial distribution (default: 100k)
     
     Returns:
         Path to created .2dgs_octree directory
     """
     import json
     from collections import defaultdict
-    from .export_ply import read_ply
+    from .export_ply import read_ply, stream_ply_chunks
     
     ply_path = Path(ply_path)
     if output_dir is None:
@@ -480,30 +482,21 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
     
     print(f"Total points to convert: {n_surfels_total:,}")
     
-    # Process in chunks - use SMALLER batches to avoid memory issues
-    print("Reading and distributing points...")
+    # Process in chunks using STREAMING reader - memory efficient!
+    print("Reading and distributing points (streaming)...")
     chunks = defaultdict(lambda: {'data': [], 'min': [float('inf')]*3, 'max': [float('-inf')]*3})
     
-    # Use 500k batch size to avoid memory issues with large concatenations
-    batch_size = 500000
+    # Use streaming reader - processes PLY in chunks without loading entire file
+    # Default streaming chunk size is 100k points
+    stream_chunk_size = min(chunk_size, 100000)  # Match the function's default
     
-    start_idx = 0
-    while start_idx < n_surfels_total:
-        num_to_read = min(batch_size, n_surfels_total - start_idx)
-        surfels = read_ply(str(ply_path), max_memory_gb=4, start_idx=start_idx, num_points=num_to_read)
-        
-        if surfels is None:
-            break
-            
+    total_processed = 0
+    for surfels in stream_ply_chunks(str(ply_path), chunk_size=stream_chunk_size, verbose=False):
         positions = surfels.get('position', [])
         if len(positions) == 0:
             break
         
-        positions = surfels['position']
         n_points = len(positions)
-        
-        if n_points == 0:
-            break
         
         # Compute chunk indices
         chunk_indices = ((positions - min_bound) / chunk_size_world).astype(np.int32)
@@ -535,11 +528,10 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
                 if pt[j] > chunks[chunk_key]['max'][j]:
                     chunks[chunk_key]['max'][j] = pt[j]
         
-        print(f"  Processed {start_idx + n_points:,} points...")
+        total_processed += n_points
+        print(f"  Processed {total_processed:,} points...")
         
-        del surfels, data
-        
-        start_idx += batch_size
+        del surfels, data, positions, chunk_indices
     
     # Write chunks
     print(f"Writing {len(chunks)} chunks (incremental to avoid memory issues)...")
@@ -564,7 +556,7 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
         # Process this chunk in smaller pieces to avoid memory issues
         # Convert list of arrays to a single array piece by piece
         chunk_arrays = chunk_info['data']
-        n_total = sum(len(a) for a in chunk_arrays)
+        n_total = len(chunk_arrays)  # Each entry is one surfel (23 floats), not the array length
         
         if n_total == 0:
             continue
