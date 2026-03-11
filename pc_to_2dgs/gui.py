@@ -475,6 +475,15 @@ class ConverterGUI:
                                        state=tk.DISABLED)
         self.delete_btn.pack(side=tk.RIGHT, padx=4)
         
+        # Octree toggle checkbox
+        self.use_octree_var = tk.BooleanVar(value=True)  # Default: use octree if available
+        self.use_octree_cb = ttk.Checkbutton(
+            viewer_frame, 
+            text="Enable octree",
+            variable=self.use_octree_var
+        )
+        self.use_octree_cb.pack(anchor=tk.W, padx=8, pady=(0, 8))
+        
     def create_card(self, parent, title):
         """Create a card container."""
         card = tk.Frame(parent, bg=COLORS['card_bg'], bd=1, relief=tk.SOLID,
@@ -762,8 +771,80 @@ class ConverterGUI:
             return
         
         import subprocess
+        from pathlib import Path
+        
         viewer_script = str(Path(__file__).parent / "tools" / "viewer.py")
-        subprocess.Popen([sys.executable, viewer_script, str(self.selected_output_file)])
+        
+        # Check if Enable Octree is checked
+        if self.use_octree_var.get():
+            # Check if .2dgs_octree folder already exists
+            octree_path = self.selected_output_file.with_suffix('.2dgs_octree')
+            
+            if octree_path.exists():
+                # Check if it has chunk files
+                chunk_files = list(octree_path.glob("chunk_*.bin"))
+                if chunk_files:
+                    print(f"Opening existing octree: {octree_path}")
+                    cmd = [sys.executable, viewer_script, str(octree_path)]
+                else:
+                    # Octree folder exists but empty - convert again
+                    print(f"Octree folder exists but empty. Creating octree...")
+                    self._convert_and_view(self.selected_output_file, viewer_script)
+                    return
+            else:
+                # Octree doesn't exist - create it first
+                print(f"Creating octree for: {self.selected_output_file}")
+                self._convert_and_view(self.selected_output_file, viewer_script)
+                return
+        else:
+            # Enable Octree is OFF - load PLY directly
+            print(f"Opening original PLY directly: {self.selected_output_file}")
+            cmd = [sys.executable, viewer_script, str(self.selected_output_file), "--force-ply"]
+        
+        subprocess.Popen(cmd)
+    
+    def _convert_and_view(self, ply_file, viewer_script):
+        """Convert PLY to octree, then open viewer."""
+        import subprocess
+        from pathlib import Path
+        
+        # Use subprocess to run the conversion as a module
+        # This avoids import issues with relative imports
+        pc_to_2dgs_dir = Path(__file__).parent.parent
+        
+        # Build command - run as module to properly handle relative imports
+        cmd = [
+            sys.executable, "-m", "pc_to_2dgs.src.octree_io", str(ply_file)
+        ]
+        
+        print(f"Converting {ply_file.name} to octree format (this may take a while)...")
+        
+        # Run conversion and capture output
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(pc_to_2dgs_dir))
+        
+        if proc.returncode != 0:
+            print(f"Conversion failed: {proc.stderr}")
+            return
+        
+        # Parse output to get octree path - look for the path in stdout
+        output = proc.stdout
+        for line in output.split('\n'):
+            if line.startswith('OCTREE_PATH:'):
+                octree_path = line.split(':', 1)[1].strip()
+                break
+        else:
+            # If no marker found, try to extract path from last line or use expected path
+            lines = [l for l in output.strip().split('\n') if l]
+            if lines:
+                # Last non-empty line might contain the path
+                octree_path = lines[-1].strip()
+            else:
+                print(f"Could not find octree path in output: {output}")
+                return
+        
+        print(f"Opening octree viewer: {octree_path}")
+        view_cmd = [sys.executable, viewer_script, octree_path]
+        subprocess.Popen(view_cmd)
         
     def delete_selected(self):
         """Delete the selected output file."""

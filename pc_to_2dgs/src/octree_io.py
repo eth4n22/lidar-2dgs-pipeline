@@ -610,5 +610,19 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
     print(f"  Total surfels: {total_written:,}")
     print(f"  Chunks: {len(chunks)}")
     print(f"  Output: {octree_dir}")
+    print(f"OCTREE_PATH:{octree_dir}")
     
     return str(octree_dir)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python -m pc_to_2dgs.src.octree_io <ply_file> [output_dir]")
+        sys.exit(1)
+    
+    ply_file = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    result = convert_ply_to_octree(ply_file, output_dir)
+    print(f"OCTREE_PATH:{result}")
