@@ -11,7 +11,6 @@ Usage:
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
-import os
 from pathlib import Path
 import sys
 import time
@@ -795,36 +794,45 @@ class ConverterGUI:
         viewer_script = str(Path(__file__).parent / "tools" / "viewer.py")
         view_mode = self.view_mode_var.get()
         
+        # Get the PLY file path (not octree directory)
+        ply_file = self.selected_output_file
+        
+        # If selected path is a .2dgs_octree directory, find the corresponding .ply file
+        if str(ply_file).endswith('.2dgs_octree') or ply_file.suffix == '.2dgs_octree':
+            # Convert directory path to .ply file path
+            ply_file = ply_file.parent / (ply_file.stem + ".ply")
+        
         if view_mode == "ply":
             # Direct PLY mode - load directly without octree
-            print(f"Opening original PLY directly: {self.selected_output_file}")
-            cmd = [sys.executable, viewer_script, str(self.selected_output_file), "--force-ply"]
+            print(f"Opening original PLY directly: {ply_file}")
+            cmd = [sys.executable, viewer_script, str(ply_file), "--force-ply"]
             subprocess.Popen(cmd)
             
         elif view_mode == "octree":
-            # Octree (distance-based) mode - current behavior
-            octree_path = self.selected_output_file.with_suffix('.2dgs_octree')
+            # Octree (distance-based) mode
+            octree_path = ply_file.with_suffix('.2dgs_octree')
             
             if octree_path.exists():
                 chunk_files = list(octree_path.glob("chunk_*.bin"))
                 if chunk_files:
                     print(f"Opening existing octree: {octree_path}")
-                    cmd = [sys.executable, viewer_script, str(octree_path), "--mode", "octree"]
+                    cmd = [sys.executable, viewer_script, str(octree_path)]
+                    subprocess.Popen(cmd)
+                    return
                 else:
                     # Octree folder exists but empty - convert again
                     print(f"Octree folder exists but empty. Creating octree...")
-                    self._convert_and_view(self.selected_output_file, viewer_script, "octree")
+                    self._convert_and_view(ply_file, viewer_script)
                     return
             else:
                 # Octree doesn't exist - create it first
-                print(f"Creating octree for: {self.selected_output_file}")
-                self._convert_and_view(self.selected_output_file, viewer_script, "octree")
+                print(f"Creating octree for: {ply_file}")
+                self._convert_and_view(ply_file, viewer_script)
                 return
                 
         elif view_mode == "hierarchical":
             # Hierarchical (LOD) mode - stage as octree for now
-            # Note: Full LOD implementation is a future enhancement
-            octree_path = self.selected_output_file.with_suffix('.2dgs_octree')
+            octree_path = ply_file.with_suffix('.2dgs_octree')
             
             if octree_path.exists():
                 chunk_files = list(octree_path.glob("chunk_*.bin"))
@@ -832,16 +840,18 @@ class ConverterGUI:
                     print(f"Opening octree in hierarchical mode: {octree_path}")
                     print("  (Note: Full LOD viewing is planned for future)")
                     cmd = [sys.executable, viewer_script, str(octree_path), "--mode", "hierarchical"]
+                    subprocess.Popen(cmd)
+                    return
                 else:
                     print(f"Octree folder exists but empty. Creating octree...")
-                    self._convert_and_view(self.selected_output_file, viewer_script, "hierarchical")
+                    self._convert_and_view(ply_file, viewer_script)
                     return
             else:
-                print(f"Creating octree for: {self.selected_output_file}")
-                self._convert_and_view(self.selected_output_file, viewer_script, "hierarchical")
+                print(f"Creating octree for: {ply_file}")
+                self._convert_and_view(ply_file, viewer_script)
                 return
     
-    def _convert_and_view(self, ply_file, viewer_script, view_mode="octree"):
+    def _convert_and_view(self, ply_file, viewer_script):
         """Convert PLY to octree, then open viewer."""
         import subprocess
         from pathlib import Path
@@ -881,8 +891,7 @@ class ConverterGUI:
                 return
         
         print(f"Opening octree viewer: {octree_path}")
-        # Pass the view mode to the viewer
-        view_cmd = [sys.executable, viewer_script, octree_path, "--mode", view_mode]
+        view_cmd = [sys.executable, viewer_script, octree_path]
         subprocess.Popen(view_cmd)
         
     def delete_selected(self):

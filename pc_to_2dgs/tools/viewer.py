@@ -59,6 +59,13 @@ class SurfelViewer:
         # Check if input is already a .2dgs_octree directory
         input_path = Path(filepath)
         
+        # If path is a .2dgs_octree directory, let the existing code handle it
+        # Otherwise, error out
+        if input_path.is_dir() and not str(input_path).endswith('.2dgs_octree'):
+            print(f"Error: Expected a file, got a directory: {filepath}")
+            import sys
+            sys.exit(1)
+        
         # Check for .2dgs_octree directory
         octree_dir = input_path.with_suffix('.2dgs_octree')
         
@@ -132,8 +139,8 @@ class SurfelViewer:
             self._init_octree_viewer(filepath)
             return
         
-        # Check if .2dgs_octree exists (even partial)
-        if octree_dir.exists():
+        # Check if .2dgs_octree exists (even partial), but ONLY if force_ply is False
+        if not self.force_ply and octree_dir.exists():
             chunk_files = list(octree_dir.glob("chunk_*.bin"))
             if chunk_files:
                 print(f"Found .2dgs_octree! Viewing octree (streaming mode)...")
@@ -796,8 +803,8 @@ def main():
                 view_mode = "ply"  # Fall back to PLY
         
         # Handle each mode
-        if view_mode == "ply":
-            # Force PLY loading
+        if view_mode == "ply" or args.force_ply:
+            # Force PLY loading - ignore any octree
             filepath = str(input_path)
             print(f"Loading original PLY directly: {filepath}")
         elif view_mode in ("octree", "hierarchical"):
