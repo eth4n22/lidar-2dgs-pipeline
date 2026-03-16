@@ -494,8 +494,241 @@ class SurfelViewer:
             except:
                 return np.array([0, 0, 20])
     
+    def _get_camera_frustum(self):
+        """
+        Compute the camera frustum from Open3D view using camera parameters.
+        
+        Returns:
+            frustum_data: dict with camera_pos, forward, right, up, fov, aspect
+            camera_pos: Camera position in world coordinates
+        """
+        import numpy as np
+        import sys
+        
+        try:
+            vc = self.vis.get_view_control()
+            
+            # Get camera parameters including extrinsic matrix
+            params = vc.convert_to_pinhole_camera_parameters()
+            
+            # Get extrinsic matrix (camera_to_world)
+            extrinsic = np.array(params.extrinsic)
+            
+            # Camera position from extrinsic matrix: camera_pos = -R.T @ t
+            R = extrinsic[:3, :3]
+            t = extrinsic[:3, 3]
+            camera_pos = -R.T @ t
+            
+            # Lookat point: the origin in camera space maps to -R.T @ t
+            # In world space, we can compute where the camera is looking
+            # by using the camera's forward direction from the matrix
+            # 
+            # Open3D camera looks in -Z direction in camera space
+            # Transform [0, 0, -1] from camera to world coordinates
+            forward = -R.T @ np.array([0, 0, 1])  # Transform camera's -Z to world
+            forward = forward / np.linalg.norm(forward)
+            
+            # FIX: The chunk data appears to use +Z as forward, but Open3D uses -Z
+            # We need to flip the forward direction to match the chunk coordinate system
+            forward = -forward
+            
+            # Lookat is camera position + forward direction * distance
+            # Estimate lookat distance based on scene size
+            lookat_dist = 1.0  # Default 1 unit lookat distance
+            lookat = camera_pos + forward * lookat_dist
+            
+            # Compute right vector (cross product of forward and world up)
+            world_up = np.array([0, 1, 0])
+            right = np.cross(forward, world_up)
+            if np.linalg.norm(right) < 1e-6:
+                # Forward is parallel to up, use alternate up
+                world_up = np.array([1, 0, 0])
+                right = np.cross(forward, world_up)
+            right = right / np.linalg.norm(right)
+            
+            # Compute up vector
+            up = np.cross(right, forward)
+            up = up / np.linalg.norm(up)
+            
+            # Get FOV and aspect from intrinsic parameters
+            intrinsic = np.array(params.intrinsic.intrinsic_matrix)
+            width = params.intrinsic.width
+            height = params.intrinsic.height
+            
+            # FOV from intrinsic matrix (fx = f * width, so fov = 2 * arctan((width/2) / fx))
+            fx = intrinsic[0, 0]
+            fov = 2 * np.arctan((width / 2) / fx)
+            
+            aspect = width / height
+            
+            # Build frustum data
+            frustum_data = {
+                'camera_pos': camera_pos,
+                'forward': forward,
+                'right': right,
+                'up': up,
+                'fov': fov,
+                'aspect': aspect,
+            }
+            
+            return frustum_data, camera_pos
+            
+        except Exception as e:
+            print(f"Warning: Could not compute frustum: {e}", file=sys.stderr)
+            return None, None
+    
+    def _frustum_intersects_box(self, frustum_data, bounds):
+        """
+        Test if a bounding box intersects the frustum using simple cone test.
+        
+        Args:
+            frustum_data: dict with camera_pos, forward, right, up, fov, aspect
+            bounds: (min_x, min_y, min_z, max_x, max_y, max_z)
+        
+        Returns:
+            True if box intersects or is inside frustum, False if completely outside
+        """
+        import numpy as np
+        
+        if frustum_data is None:
+            return True  # No frustum data, assume visible
+        
+        camera_pos = frustum_data['camera_pos']
+        forward = frustum_data['forward']
+        right = frustum_data['right']
+        up = frustum_data['up']
+        fov = frustum_data['fov']
+        aspect = frustum_data['aspect']
+        
+        min_x, min_y, min_z, max_x, max_y, max_z = bounds
+        
+        # Get the center of the box
+        center = np.array([
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
+            (min_z + max_z) / 2
+        ])
+        
+        # Get the half-extents of the box
+        half_extent = np.array([
+            (max_x - min_x) / 2,
+            (max_y - min_y) / 2,
+            (max_z - min_z) / 2
+        ])
+        
+        # Vector from camera to box center
+        to_center = center - camera_pos
+        dist = np.linalg.norm(to_center)
+        
+        if dist < 0.001:
+            # Camera is inside or very close to the box - always visible
+            return True
+        
+        # Normalize direction to box center
+        dir_to_center = to_center / dist
+        
+        # Check 1: Is the box in front of the camera? (dot product with forward > 0)
+        if np.dot(dir_to_center, forward) <= 0:
+            # Box is behind the camera
+            return False
+        
+        # Check 2: Is the box within the FOV cone?
+        # Compute the angle between forward and direction to box
+        cos_angle = np.dot(dir_to_center, forward)
+        angle = np.arccos(np.clip(cos_angle, -1, 1))
+        
+        # Horizontal half-angle
+        h_half_fov = fov / 2
+        # Vertical half-angle
+        v_half_fov = np.arctan(np.tan(h_half_fov) / aspect)
+        
+        # The angular radius of the box is the angle subtended by its half-extent
+        # Simplified: use the larger angular extent
+        max_extent = max(half_extent[0], half_extent[2])  # Use horizontal and depth
+        angular_radius = np.arctan(np.sqrt(max_extent**2 + half_extent[1]**2) / dist) if dist > 0 else 0
+        
+        # Check if the box center direction is within the FOV plus the box's angular radius
+        # Also add some margin
+        margin = np.arctan(0.1 / dist) if dist > 0 else 0.1  # Add margin based on distance
+        if angle > h_half_fov + angular_radius + margin:
+            return False
+        
+        # Check 3: Near plane - box must be beyond near clipping plane
+        # Project box center onto forward direction to get distance
+        dist_along_forward = np.dot(to_center, forward)
+        if dist_along_forward < 0.01:  # Near plane at 0.01 units
+            return False
+        
+        # Box passes all tests - it's visible
+        return True
+    
+    def _frustum_intersects_box_debug(self, frustum_data, bounds):
+        """
+        Debug version of frustum test that returns WHY a box was culled.
+        
+        Returns:
+            (result, reason): result is bool, reason is string
+        """
+        import numpy as np
+        
+        if frustum_data is None:
+            return True, "no_frustum"
+        
+        camera_pos = frustum_data['camera_pos']
+        forward = frustum_data['forward']
+        fov = frustum_data['fov']
+        aspect = frustum_data['aspect']
+        
+        min_x, min_y, min_z, max_x, max_y, max_z = bounds
+        
+        # Get the center of the box
+        center = np.array([
+            (min_x + max_x) / 2,
+            (min_y + max_y) / 2,
+            (min_z + max_z) / 2
+        ])
+        
+        # Get the half-extents
+        half_extent = np.array([
+            (max_x - min_x) / 2,
+            (max_y - min_y) / 2,
+            (max_z - min_z) / 2
+        ])
+        
+        # Vector from camera to box center
+        to_center = center - camera_pos
+        dist = np.linalg.norm(to_center)
+        
+        if dist < 0.001:
+            return True, "camera_inside"
+        
+        dir_to_center = to_center / dist
+        
+        # Check 1: Is the box in front of the camera?
+        if np.dot(dir_to_center, forward) <= 0:
+            return False, "behind_camera"
+        
+        # Check 2: Is the box within the FOV cone?
+        cos_angle = np.dot(dir_to_center, forward)
+        angle = np.arccos(np.clip(cos_angle, -1, 1))
+        
+        h_half_fov = fov / 2
+        max_extent = max(half_extent[0], half_extent[2])
+        angular_radius = np.arctan(np.sqrt(max_extent**2 + half_extent[1]**2) / dist) if dist > 0 else 0
+        margin = np.arctan(0.1 / dist) if dist > 0 else 0.1
+        
+        if angle > h_half_fov + angular_radius + margin:
+            return False, "outside_fov"
+        
+        # Check 3: Near plane
+        dist_along_forward = np.dot(to_center, forward)
+        if dist_along_forward < 0.01:
+            return False, "near_plane"
+        
+        return True, "visible"
+    
     def _update_visible_chunks(self):
-        """Update chunks based on camera - distance-based culling."""
+        """Update chunks based on camera - frustum culling + distance-based culling."""
         import numpy as np
         import sys
         
@@ -523,15 +756,72 @@ class SurfelViewer:
             self._debug_printed = True
             sys.stderr.flush()
         
-        # Get actual camera position
-        camera_pos = self._get_camera_position()
+        # === STEP 1: Get camera frustum ===
+        frustum_data, camera_pos = self._get_camera_frustum()
         
-        print(f"\n=== Chunk Selection (Distance-Based) ===", file=sys.stderr)
-        print(f"Camera position: {camera_pos}", file=sys.stderr)
+        # If frustum failed, fall back to getting camera position directly
+        if camera_pos is None:
+            camera_pos = self._get_camera_position()
         
-        # Compute distances to all chunk centers for debugging
-        all_distances = []
+        # Debug: Print chunk selection info (comment out for less verbose output)
+        # print(f"\n=== Chunk Selection ===", file=sys.stderr)
+        # print(f"Camera position: {camera_pos}", file=sys.stderr)
+        
+        # === STEP 2: Apply FRUSTUM CULLING to all chunks ===
+        chunks_in_frustum = []
+        chunks_outside_frustum = []
+        culled_by_frustum_examples = []
+        
+        # Debug tracking for WHY chunks are culled
+        culled_behind = 0
+        culled_outside_fov = 0
+        culled_near_plane = 0
+        
         for nid in self._all_chunk_nodes:
+            b = self._chunk_bounds.get(nid)
+            if b is None:
+                # No bounds info, include it
+                chunks_in_frustum.append(nid)
+                continue
+            
+            # Test if chunk bounding box intersects frustum (with detailed debug)
+            in_frustum, reason = self._frustum_intersects_box_debug(frustum_data, b)
+            
+            if in_frustum:
+                chunks_in_frustum.append(nid)
+            else:
+                chunks_outside_frustum.append(nid)
+                # Track why it was culled
+                if reason == "behind_camera":
+                    culled_behind += 1
+                elif reason == "outside_fov":
+                    culled_outside_fov += 1
+                elif reason == "near_plane":
+                    culled_near_plane += 1
+                # Track a few examples for debug output
+                if len(culled_by_frustum_examples) < 5:
+                    cx = (b[0] + b[3]) / 2
+                    cy = (b[1] + b[4]) / 2
+                    cz = (b[2] + b[5]) / 2
+                    culled_by_frustum_examples.append(f"{nid}: {reason}, center=({cx:.1f},{cy:.1f},{cz:.1f})")
+        
+        # Debug output for frustum culling (comment out for less verbose output)
+        # print(f"Total chunks: {len(self._all_chunk_nodes)}", file=sys.stderr)
+        # print(f"Chunks INSIDE frustum: {len(chunks_in_frustum)}", file=sys.stderr)
+        # print(f"Chunks OUTSIDE frustum: {len(chunks_outside_frustum)}", file=sys.stderr)
+        # print(f"  - culled behind camera: {culled_behind}", file=sys.stderr)
+        # print(f"  - culled outside FOV: {culled_outside_fov}", file=sys.stderr)
+        # print(f"  - culled near plane: {culled_near_plane}", file=sys.stderr)
+        # if culled_by_frustum_examples:
+        #     print(f"Sample culled chunks: {culled_by_frustum_examples}", file=sys.stderr)
+        # sys.stderr.flush()
+        
+        # === STEP 3: Apply DISTANCE FILTERING to frustum-culled chunks ===
+        max_dist = self.distance_threshold  # units
+        
+        # Compute distances only for chunks in frustum
+        visible_with_dist = []
+        for nid in chunks_in_frustum:
             b = self._chunk_bounds.get(nid)
             if b is None:
                 continue
@@ -541,23 +831,11 @@ class SurfelViewer:
                 (b[2] + b[5]) / 2
             ])
             dist = np.linalg.norm(center - camera_pos)
-            all_distances.append((nid, dist, center))
+            visible_with_dist.append((nid, dist, center))
         
-        # Sort by distance
-        all_distances.sort(key=lambda x: x[1])
-        
-        # Print nearest/farthest
-        if all_distances:
-            nearest = all_distances[0]
-            farthest = all_distances[-1]
-            print(f"Nearest chunk: {nearest[0]} at dist={nearest[1]:.2f}, center={nearest[2]}", file=sys.stderr)
-            print(f"Farthest chunk: {farthest[0]} at dist={farthest[1]:.2f}", file=sys.stderr)
-        
-        # Load chunks within distance threshold
-        max_dist = self.distance_threshold  # units
+        # Filter by distance
         visible = []
-        
-        for nid, dist, center in all_distances:
+        for nid, dist, center in visible_with_dist:
             if dist < max_dist:
                 visible.append((nid, dist))
         
@@ -565,26 +843,31 @@ class SurfelViewer:
         visible.sort(key=lambda x: x[1])
         visible = [nid for nid, _ in visible]
         
-        cache = self.octree_viewer.cache_size
-        print(f"Chunks within {max_dist}m: {len(visible)}", file=sys.stderr)
+        # Debug output (comment out for less verbose output)
+        # print(f"Chunks passing distance filter ({max_dist}m): {len(visible)}", file=sys.stderr)
         
-        # Limit to cache size
+        # === STEP 4: Limit to cache size ===
+        cache = self.octree_viewer.cache_size
         if len(visible) > cache:
             visible = visible[:cache]
         
-        # Determine what changed
+        # Debug output
+        # print(f"Loaded chunks (after cache limit): {len(visible)}", file=sys.stderr)
+        
+        # === STEP 5: Determine what changed and reload ===
         new_c = set(visible) - self._loaded_chunk_ids
         old_c = self._loaded_chunk_ids - set(visible)
         
-        print(f"Currently loaded: {len(self._loaded_chunk_ids)} | Will load: {len(visible)} | +{len(new_c)} -{len(old_c)}", file=sys.stderr)
-        sys.stderr.flush()
+        # Debug output
+        # print(f"Currently loaded: {len(self._loaded_chunk_ids)} | Will load: {len(visible)} | +{len(new_c)} -{len(old_c)}", file=sys.stderr)
+        # sys.stderr.flush()
         
         # Reload if changed
         if new_c or old_c:
             self._load_chunks_streaming(visible)
-        else:
-            print("No chunk changes needed.", file=sys.stderr)
-            sys.stderr.flush()
+        # else:
+        #     print("No chunk changes needed.", file=sys.stderr)
+        #     sys.stderr.flush()
     
     def log_chunk_status(self, vis):
         """Log current streaming status."""
