@@ -999,6 +999,10 @@ class SurfelViewer:
             # Register animation callback for automatic chunk loading based on camera position
             self._last_camera_pos = None
             self._chunk_reload_counter = 0
+            # Time-based debounce for smoother navigation
+            import time
+            self._last_movement_time = time.time()
+            self._debounce_interval = 0.15  # 150ms - wait for camera to settle
             self.vis.register_animation_callback(self._animation_callback)
         else:
             print("\nControls:")
@@ -1011,6 +1015,7 @@ class SurfelViewer:
     def _animation_callback(self, vis):
         """Animation callback - checks camera position and reloads chunks if needed."""
         import numpy as np
+        import time
         
         # Only check every 10 frames to reduce overhead
         self._chunk_reload_counter += 1
@@ -1023,18 +1028,27 @@ class SurfelViewer:
         
         # Get current camera position
         camera_pos = self._get_camera_position()
+        current_time = time.time()
         
         # Check if camera moved significantly
         if self._last_camera_pos is not None:
             dist_moved = np.linalg.norm(camera_pos - self._last_camera_pos)
             
-            # Only reload if moved more than 0.05 units
+            # Camera is moving - update the last movement time
             if dist_moved > 0.05:
                 self._last_camera_pos = camera_pos
-                self._update_visible_chunks()
-                return True
+                self._last_movement_time = current_time
+            else:
+                # Camera has stopped - check if debounce interval has passed
+                time_since_movement = current_time - self._last_movement_time
+                if time_since_movement >= self._debounce_interval:
+                    # Enough time has passed since camera stopped - reload chunks
+                    self._last_camera_pos = camera_pos
+                    self._update_visible_chunks()
+                    return True
         else:
             self._last_camera_pos = camera_pos
+            self._last_movement_time = current_time
         
         return False
 
