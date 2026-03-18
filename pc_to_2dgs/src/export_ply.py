@@ -82,51 +82,53 @@ def write_ply(filepath: str, surfels: Dict[str, np.ndarray], binary: bool = Fals
     header_lines.append("end_header")
     
     if binary:
-        # Write binary PLY
+        # Write binary PLY - VECTORIZED for massive speedup
         with open(path, 'wb') as f:
             # Write header
             header_bytes = "\n".join(header_lines).encode('ascii') + b"\n"
             f.write(header_bytes)
             
-            # Write vertex data as binary float32 (little-endian)
-            for i in range(n_surfels):
-                data = []
-                data.extend(surfels["position"][i].tolist())
-                data.extend(surfels["normal"][i].tolist())
-                data.extend(surfels["tangent"][i].tolist())
-                data.extend(surfels["bitangent"][i].tolist())
-                data.append(float(surfels["opacity"][i]))
-                data.extend(surfels["scale"][i].tolist())
-                data.extend(surfels["rotation"][i].tolist())
-                data.extend(surfels["color"][i].tolist())
-                
-                # Pack as float32 little-endian using struct
-                f.write(struct.pack(f'<{len(data)}f', *data))
+            # Stack all data into a single contiguous float32 array
+            # This is MUCH faster than per-point struct.pack
+            vertex_data = np.hstack([
+                surfels["position"],      # (N, 3)
+                surfels["normal"],         # (N, 3)
+                surfels["tangent"],        # (N, 3)
+                surfels["bitangent"],      # (N, 3)
+                surfels["opacity"][:, np.newaxis],  # (N, 1)
+                surfels["scale"],          # (N, 3)
+                surfels["rotation"],       # (N, 4)
+                surfels["color"],          # (N, 3)
+            ]).astype(np.float32)
+            
+            # Write all at once - uses numpy's optimized C code
+            vertex_data.tofile(f)
     else:
-        # Write ASCII PLY (original behavior)
+        # Write ASCII PLY - optimized batch writing
         with open(path, 'w') as f:
             f.write("\n".join(header_lines) + "\n")
             
-            # Write vertex data
+            # Stack all data for batch processing
+            vertex_data = np.hstack([
+                surfels["position"],      # (N, 3)
+                surfels["normal"],       # (N, 3)
+                surfels["tangent"],      # (N, 3)
+                surfels["bitangent"],    # (N, 3)
+                surfels["opacity"][:, np.newaxis],  # (N, 1)
+                surfels["scale"],        # (N, 3)
+                surfels["rotation"],     # (N, 4)
+                surfels["color"],        # (N, 3)
+            ])
+            
+            # Convert to lines in batches - much faster than per-line
+            lines = []
             for i in range(n_surfels):
-                values = []
-                values.extend(surfels["position"][i].tolist())
-                values.extend(surfels["normal"][i].tolist())
-                values.extend(surfels["tangent"][i].tolist())
-                values.extend(surfels["bitangent"][i].tolist())
-                values.append(float(surfels["opacity"][i]))
-                values.extend(surfels["scale"][i].tolist())
-                values.extend(surfels["rotation"][i].tolist())
-                values.extend(surfels["color"][i].tolist())
-                
-                formatted = []
-                for v in values:
-                    if isinstance(v, float):
-                        formatted.append(f"{v:.10f}")
-                    else:
-                        formatted.append(str(v))
-                
-                f.write(" ".join(formatted) + "\n")
+                # Format with high precision
+                vals = vertex_data[i]
+                line = " ".join([f"{v:.10f}" for v in vals])
+                lines.append(line)
+            
+            f.write("\n".join(lines) + "\n")
     
     format_name = "binary" if binary else "ASCII"
     print(f"  Wrote {n_surfels} surfels to {filepath} ({format_name})")
