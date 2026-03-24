@@ -174,13 +174,18 @@ def scales_from_covariance(covariances: np.ndarray, base_scale: float = 1.0) -> 
         (N, 3) scale factors
     """
     n = covariances.shape[0]
-    scales = np.zeros((n, 3), dtype=np.float64)
     
-    for i in range(n):
-        # Compute eigenvalues
-        eigenvalues = np.linalg.eigvalsh(covariances[i])
-        eigenvalues = np.maximum(eigenvalues, 1e-10)  # Ensure positive
-        scales[i] = np.sqrt(eigenvalues) * base_scale
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    
+    # Vectorized: compute all eigenvalues at once
+    # Reshape to (-1, 3, 3) for batch processing
+    covariances_flat = covariances.reshape(-1, 3, 3)
+    all_eigenvalues = np.linalg.eigvalsh(covariances_flat)  # (N, 3)
+    
+    # Ensure positive and compute sqrt
+    all_eigenvalues = np.maximum(all_eigenvalues, 1e-10)
+    scales = np.sqrt(all_eigenvalues) * base_scale
     
     return scales
 

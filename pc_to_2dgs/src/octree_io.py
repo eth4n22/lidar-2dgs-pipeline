@@ -533,8 +533,8 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
         
         del surfels, data, positions, chunk_indices
     
-    # Write chunks
-    print(f"Writing {len(chunks)} chunks (incremental to avoid memory issues)...")
+    # Write chunks - PARALLELIZED for speedup
+    print(f"Writing {len(chunks)} chunks in parallel...")
     
     hierarchy = {
         'node_id': 'root',
@@ -548,20 +548,19 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
     total_written = 0
     n_props = 23
     
-    # Write each chunk individually to avoid memory issues
-    for chunk_key, chunk_info in chunks.items():
+    # Helper function for parallel chunk writing
+    def write_chunk_file(chunk_key, chunk_info, octree_dir):
+        """Write a single chunk file. Each job handles one file independently."""
         if not chunk_info['data']:
-            continue
+            return None
         
-        # Process this chunk in smaller pieces to avoid memory issues
-        # Convert list of arrays to a single array piece by piece
         chunk_arrays = chunk_info['data']
-        n_total = len(chunk_arrays)  # Each entry is one surfel (23 floats), not the array length
+        n_total = len(chunk_arrays)
         
         if n_total == 0:
-            continue
+            return None
         
-        # Write chunk file directly without concatenating all at once
+        # Write chunk file
         chunk_file = f"chunk_{chunk_key}_lod0.bin"
         chunk_path = octree_dir / chunk_file
         
@@ -569,24 +568,61 @@ def convert_ply_to_octree(ply_path: str, output_dir: str = None, chunk_size: int
             # Write number of surfels
             f.write(struct.pack('<I', n_total))
             
-            # Write each piece directly to avoid large concatenation
+            # Write each piece directly
             for arr in chunk_arrays:
                 arr_float = np.ascontiguousarray(arr, dtype=np.float32)
                 f.write(arr_float.tobytes())
         
-        hierarchy['children'].append({
+        # Return metadata for hierarchy building
+        return {
             'node_id': chunk_key,
             'chunk_file': chunk_file,
             'num_surfels': n_total,
             'bounds': {
-                'min_x': float(chunk_info['min'][0]), 'min_y': float(chunk_info['min'][1]), 'min_z': float(chunk_info['min'][2]),
-                'max_x': float(chunk_info['max'][0]), 'max_y': float(chunk_info['max'][1]), 'max_z': float(chunk_info['max'][2])
-            },
-            'children': []
-        })
+                'min_x': float(chunk_info['min'][0]),
+                'min_y': float(chunk_info['min'][1]),
+                'min_z': float(chunk_info['min'][2]),
+                'max_x': float(chunk_info['max'][0]),
+                'max_y': float(chunk_info['max'][1]),
+                'max_z': float(chunk_info['max'][2])
+            }
+        }
+    
+    # Try parallel chunk writing with joblib
+    try:
+        from joblib import Parallel, delayed
         
-        total_written += n_total
-        # Clear from memory
+        print(f"  Using parallel chunk writing...")
+        
+        # Parallel write - each job writes one chunk file independently
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(write_chunk_file)(chunk_key, chunk_info, octree_dir)
+            for chunk_key, chunk_info in chunks.items()
+            if chunk_info['data']
+        )
+        
+        # Collect results and build hierarchy sequentially
+        for result in results:
+            if result is not None:
+                hierarchy['children'].append(result)
+                total_written += result['num_surfels']
+        
+        print(f"  Parallel write complete: {len([r for r in results if r])} chunks")
+        
+    except ImportError:
+        # Fallback to sequential if joblib not available
+        print(f"  joblib not available, using sequential write...")
+        
+        for chunk_key, chunk_info in chunks.items():
+            result = write_chunk_file(chunk_key, chunk_info, octree_dir)
+            if result is not None:
+                hierarchy['children'].append(result)
+                total_written += result['num_surfels']
+            # Clear from memory
+            chunk_info['data'] = []
+    
+    # Clear chunk data to free memory
+    for chunk_info in chunks.values():
         chunk_info['data'] = []
     
     print(f"  Wrote {len(chunks)} chunks, {total_written:,} total points")

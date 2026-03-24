@@ -770,17 +770,24 @@ class ConverterGUI:
             
     def _log_callback(self, message):
         """Handle log message for stage detection."""
-        if "Loading" in message:
+        # Use more specific checks to avoid premature progress updates
+        if "Loading" in message and "Loading..." not in self.progress_label.cget("text"):
             self.set_progress(10, "Loading...")
         elif "Preprocessing" in message:
             self.set_progress(25, "Preprocessing...")
-        elif "Normals" in message:
-            self.set_progress(50, "Computing normals...")
-        elif "Surfels" in message:
-            self.set_progress(75, "Building surfels...")
+        elif "Normal" in message or "Chunked" in message:
+            # Match "Normals" or "Normal Estimation" or "Chunked Normal"
+            if "Computing normals" not in self.progress_label.cget("text"):
+                self.set_progress(50, "Computing normals...")
+        elif "Surf" in message or "Building" in message:
+            # Match "Surfels" or "Building surfels"
+            if "Building surfels" not in self.progress_label.cget("text"):
+                self.set_progress(75, "Building surfels...")
         elif "Export" in message or "Saving" in message:
-            self.set_progress(90, "Saving...")
-        elif "complete" in message.lower():
+            if "Saving" not in self.progress_label.cget("text"):
+                self.set_progress(90, "Saving...")
+        elif "Conversion complete" in message or "complete in" in message.lower():
+            # Only match final completion messages, not intermediate "Completed X chunks"
             self.set_progress(100, "Complete!")
             
     def view_selected(self):

@@ -6,15 +6,16 @@ Memory-safe version for large point clouds (100M+ points).
 
 Supports:
 - GPU acceleration via PyTorch (NVIDIA RTX 3060+ compatible)
-- FAISS-accelerated neighbor search for large datasets
+- Chunked spatial partitioning for large datasets
 - Vectorized CPU fallback for systems without GPU
 """
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import numpy as np
 from scipy.spatial import cKDTree, KDTree
 from scipy.linalg import eigh
 import gc
+import os
 
 # Optional GPU acceleration via PyTorch
 try:
@@ -23,12 +24,226 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-# Optional FAISS for fast neighbor search
-try:
-    import faiss
-    HAS_FAISS = True
-except ImportError:
-    HAS_FAISS = False
+
+def partition_point_cloud_spatial(points: np.ndarray, 
+                                  chunk_size: int = 500000,
+                                  overlap_factor: float = 0.15) -> List[Dict]:
+    """
+    Partition point cloud into spatial chunks with overlap.
+    
+    Args:
+        points: (N, 3) xyz coordinates
+        chunk_size: Target points per chunk (default: 500K)
+        overlap_factor: Overlap as fraction of chunk size (default: 0.15)
+    
+    Returns:
+        List of chunk dicts with:
+        - 'indices': global indices of core points
+        - 'points': all points in chunk (core + halo)
+        - 'local_to_global': mapping from local to global indices
+    """
+    n_points = points.shape[0]
+    
+    # Calculate number of chunks needed
+    n_chunks = max(1, int(np.ceil(n_points / chunk_size)))
+    
+    # Calculate bounding box
+    min_coords = points.min(axis=0)
+    max_coords = points.max(axis=0)
+    ranges = max_coords - min_coords
+    
+    # Find optimal grid dimensions
+    dim = 3
+    grid_size = int(np.ceil(n_chunks ** (1.0 / dim)))
+    
+    # Calculate chunk sizes per dimension
+    chunk_ranges = ranges / grid_size
+    overlap = chunk_ranges * overlap_factor
+    
+    chunks = []
+    global_indices = np.arange(n_points)
+    
+    for i in range(grid_size):
+        for j in range(grid_size):
+            for k in range(grid_size):
+                # Calculate bounds for this chunk
+                chunk_min = min_coords + np.array([i, j, k]) * chunk_ranges - overlap
+                chunk_max = min_coords + np.array([i+1, j+1, k+1]) * chunk_ranges + overlap
+                
+                # Find points in this region
+                mask = ((points >= chunk_min) & (points <= chunk_max)).all(axis=1)
+                chunk_indices = np.where(mask)[0]
+                
+                if len(chunk_indices) == 0:
+                    continue
+                
+                # Add to chunks list
+                chunks.append({
+                    'indices': chunk_indices,  # Global indices
+                    'points': points[chunk_indices],  # Points for this chunk
+                    'local_to_global': chunk_indices  # Identity mapping
+                })
+    
+    return chunks
+
+
+def estimate_normals_chunked(points: np.ndarray,
+                            k: int = 10,
+                            chunk_size: int = 500000,
+                            overlap_factor: float = 0.15,
+                            device: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Chunked normal estimation for very large point clouds.
+    
+    Partitions point cloud into spatial chunks and processes each independently.
+    This reduces memory usage and allows processing of 100M+ point clouds.
+    
+    Args:
+        points: (N, 3) xyz coordinates
+        k: Number of neighbors for local neighborhood
+        chunk_size: Target points per chunk (default: 500K)
+        overlap_factor: Overlap between chunks (default: 0.15)
+        device: 'cuda', 'mps', or 'cpu'. Auto-detects if None.
+    
+    Returns:
+        Tuple of:
+        - normals: (N, 3) surface normals (unit length, float32)
+        - curvatures: (N,) curvature values (float32)
+    """
+    n_points = points.shape[0]
+    
+    if n_points < 3:
+        return np.zeros((n_points, 3), dtype=np.float32), np.zeros(n_points, dtype=np.float32)
+    
+    if device is None:
+        device = get_device()
+    
+    print(f"  Chunked Normal Estimation ({device})")
+    print(f"    Total points: {n_points:,}, k={k}, chunk_size={chunk_size:,}")
+    
+    # Partition into spatial chunks
+    chunks = partition_point_cloud_spatial(points, chunk_size, overlap_factor)
+    n_chunks = len(chunks)
+    print(f"    Number of chunks: {n_chunks}")
+    
+    # Assert: All points should be covered by chunks
+    covered_indices = set()
+    for chunk in chunks:
+        covered_indices.update(chunk['indices'])
+    assert len(covered_indices) == n_points, f"Chunk coverage error: {len(covered_indices)}/{n_points} points covered"
+    
+    # Preallocate output arrays
+    normals = np.zeros((n_points, 3), dtype=np.float32)
+    curvatures = np.zeros(n_points, dtype=np.float32)
+    
+    # Process each chunk
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk_points = chunk['points']
+        global_indices = chunk['indices']
+        chunk_n = len(chunk_points)
+        
+        if chunk_n < 3:
+            continue
+        
+        if chunk_idx % 5 == 0 or chunk_idx == n_chunks - 1:
+            print(f"    Chunk {chunk_idx + 1}/{n_chunks}: {chunk_n:,} points")
+        
+        # Build local cKDTree for this chunk
+        local_tree = cKDTree(chunk_points)
+        
+        # Query neighbors for all points in chunk
+        k_eff = min(k + 1, chunk_n)
+        distances, local_indices = local_tree.query(chunk_points, k=k_eff)
+        
+        # Convert to float32
+        if chunk_points.dtype != np.float32:
+            chunk_points = chunk_points.astype(np.float32)
+        
+        # Move to device
+        if device == 'cuda' and HAS_TORCH:
+            points_gpu = torch.from_numpy(chunk_points).cuda()
+        elif device == 'mps' and HAS_TORCH:
+            points_gpu = torch.from_numpy(chunk_points).to('mps')
+        elif HAS_TORCH:
+            points_gpu = torch.from_numpy(chunk_points)
+        else:
+            points_gpu = chunk_points
+        
+        # GPU PCA computation
+        if HAS_TORCH and device != 'cpu':
+            # Get neighbors
+            neighbor_indices = torch.from_numpy(local_indices[:, 1:]).long()
+            if device == 'cuda':
+                neighbor_indices = neighbor_indices.cuda()
+                points_gpu = points_gpu.cuda()
+            elif device == 'mps':
+                neighbor_indices = neighbor_indices.to('mps')
+                points_gpu = points_gpu.to('mps')
+            
+            neighbors = points_gpu[neighbor_indices]
+            
+            # PCA
+            centroids = neighbors.mean(dim=1, keepdim=True)
+            centered = neighbors - centroids
+            cov = torch.matmul(centered.transpose(1, 2), centered) / (k - 1)
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+            
+            chunk_normals = eigenvectors[:, :, 0].cpu().numpy()
+            chunk_curvatures = (eigenvalues[:, 0] / (eigenvalues.sum(dim=1) + 1e-10)).cpu().numpy()
+            
+            # Cleanup
+            del neighbors, centered, cov, eigenvalues, eigenvectors
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+        else:
+            # CPU fallback
+            neighbor_indices = local_indices[:, 1:]
+            neighbors = chunk_points[neighbor_indices]
+            
+            centroids = neighbors.mean(axis=1, keepdims=True)
+            centered = neighbors - centroids
+            cov = np.einsum('bij,bik->bjk', centered, centered) / (k - 1)
+            
+            chunk_normals = np.empty((chunk_n, 3), dtype=np.float32)
+            chunk_curvatures = np.empty(chunk_n, dtype=np.float32)
+            
+            for i in range(chunk_n):
+                eigvals, eigvecs = eigh(cov[i])
+                chunk_normals[i] = eigvecs[:, 0].astype(np.float32)
+                total = eigvals.sum()
+                chunk_curvatures[i] = eigvals[0] / total if total > 0 else 0.0
+        
+        # Flip normals to point away from origin
+        dot_products = np.sum(chunk_normals * chunk_points, axis=1)
+        flip_mask = dot_products < 0
+        chunk_normals[flip_mask] *= -1
+        
+        # Normalize
+        norms = np.linalg.norm(chunk_normals, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        chunk_normals = chunk_normals / norms
+        
+        # Store in global arrays
+        normals[global_indices] = chunk_normals
+        curvatures[global_indices] = chunk_curvatures.astype(np.float32)
+        
+        # Cleanup
+        del chunk_points, local_tree, local_indices
+        gc.collect()
+    
+    print(f"    Completed {n_chunks} chunks")
+    
+    # Assert: All normals should be computed (no zero normals)
+    zero_normals = np.where(np.all(normals == 0, axis=1))[0]
+    if len(zero_normals) > 0:
+        print(f"    Warning: {len(zero_normals)} points have zero normals")
+        # Don't fail - zero normals might be from isolated points with no neighbors
+    
+    # Assert: Output shape matches input
+    assert normals.shape[0] == n_points, f"Output normals shape mismatch: {normals.shape[0]} vs {n_points}"
+    assert curvatures.shape[0] == n_points, f"Output curvatures shape mismatch: {curvatures.shape[0]} vs {n_points}"
+    
+    return normals, curvatures
 
 
 def get_device():
@@ -103,6 +318,13 @@ def estimate_normals_gpu(points: np.ndarray,
     normals = np.empty((n_points, 3), dtype=np.float32)
     curvatures = np.empty((n_points,), dtype=np.float32)
     
+    # Build KNN index ONCE before batch loop using scipy cKDTree
+    # Note: FAISS is too slow on Windows for this workload
+    print("[INFO] Using scipy cKDTree KNN")
+    tree = cKDTree(points)
+    
+    print("[INFO] Points:", points.shape[0])
+    
     # Process in batches
     n_batches = (n_points + batch_size - 1) // batch_size
     
@@ -116,43 +338,13 @@ def estimate_normals_gpu(points: np.ndarray,
         
         batch_points = points_gpu[start:end]
         
-        # Use FAISS if available for fast neighbor search, otherwise use cKDTree
-        if HAS_FAISS and device == 'cuda':
-            # FAISS GPU search
-            points_np = batch_points.cpu().numpy()
-            index = faiss.IndexFlatL2(3)
-            index.add(points.cpu().numpy())  # Full dataset index
-            
-            # Search in batches to avoid memory issues
-            batch_search_size = min(batch_n, 100000)
-            all_indices = []
-            for search_start in range(0, batch_n, batch_search_size):
-                search_end = min(search_start + batch_search_size, batch_n)
-                _, indices_batch = index.search(points_np[search_start:search_end], k_effective)
-                all_indices.append(indices_batch)
-            indices = np.vstack(all_indices)
-        else:
-            # Use scipy cKDTree for neighbor search (still fast)
-            tree = cKDTree(points)
-            indices = tree.query(points[start:end], k=k_effective)[1]
+        # KNN search using cKDTree (built once outside loop)
+        indices = tree.query(points[start:end], k=k_effective)[1]
         
         # Get neighbors: (batch_n, k_effective, 3)
-        # Use advanced indexing on GPU
-        indices_tensor = torch.from_numpy(indices[:, 1:]).long()
-        if device == 'cuda':
-            indices_tensor = indices_tensor.cuda()
-        elif device == 'mps':
-            indices_tensor = indices_tensor.to('mps')
-        
-        # Gather neighbors - use CPU for this part to save GPU memory
-        indices_cpu = torch.from_numpy(indices[:, 1:]).long()
-        neighbors = points_gpu.cpu()[indices_cpu]  # (batch_n, k, 3)
-        
-        # Move to device for computation
-        if device == 'cuda':
-            neighbors = neighbors.cuda()
-        elif device == 'mps':
-            neighbors = neighbors.to('mps')
+        # Use GPU indices directly - keep all computation on GPU!
+        indices_gpu = torch.from_numpy(indices[:, 1:]).long().to(device)
+        neighbors = points_gpu[indices_gpu]  # All GPU, no CPU round-trip
         
         # Vectorized PCA computation on GPU
         # Compute centroids: (batch_n, 3)
@@ -298,28 +490,164 @@ def estimate_normals_vectorized_cpu(points: np.ndarray,
     return normals, curvatures
 
 
+def _process_chunk_cpu(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Process a single chunk on CPU (for parallel processing).
+    
+    Args:
+        args: Tuple of (chunk_points, global_indices, k)
+    
+    Returns:
+        Tuple of (chunk_normals, chunk_curvatures, global_indices)
+    """
+    chunk_points, global_indices, k = args
+    chunk_n = len(chunk_points)
+    
+    if chunk_n < 3:
+        normals = np.zeros((chunk_n, 3), dtype=np.float32)
+        curvatures = np.zeros(chunk_n, dtype=np.float32)
+        return normals, curvatures, global_indices
+    
+    # Ensure float32
+    if chunk_points.dtype != np.float32:
+        chunk_points = chunk_points.astype(np.float32)
+    
+    # Build local cKDTree
+    tree = cKDTree(chunk_points)
+    k_eff = min(k + 1, chunk_n)
+    distances, local_indices = tree.query(chunk_points, k=k_eff)
+    
+    # Get neighbors
+    neighbor_indices = local_indices[:, 1:]
+    neighbors = chunk_points[neighbor_indices]
+    
+    # PCA
+    centroids = neighbors.mean(axis=1, keepdims=True)
+    centered = neighbors - centroids
+    cov = np.einsum('bij,bik->bjk', centered, centered) / (k - 1)
+    
+    chunk_normals = np.empty((chunk_n, 3), dtype=np.float32)
+    chunk_curvatures = np.empty(chunk_n, dtype=np.float32)
+    
+    for i in range(chunk_n):
+        eigvals, eigvecs = eigh(cov[i])
+        chunk_normals[i] = eigvecs[:, 0].astype(np.float32)
+        total = eigvals.sum()
+        chunk_curvatures[i] = eigvals[0] / total if total > 0 else 0.0
+    
+    # Flip normals
+    dot_products = np.sum(chunk_normals * chunk_points, axis=1)
+    flip_mask = dot_products < 0
+    chunk_normals[flip_mask] *= -1
+    
+    # Normalize
+    norms = np.linalg.norm(chunk_normals, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    chunk_normals = chunk_normals / norms
+    
+    return chunk_normals, chunk_curvatures.astype(np.float32), global_indices
+
+
+def estimate_normals_chunked_parallel(points: np.ndarray,
+                                    k: int = 10,
+                                    chunk_size: int = 500000,
+                                    overlap_factor: float = 0.15,
+                                    n_jobs: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Parallel chunked normal estimation for large point clouds.
+    
+    Uses CPU parallelization for faster processing on multi-core systems.
+    Note: Uses CPU for all chunks (no GPU) but parallelizes across chunks.
+    
+    Args:
+        points: (N, 3) xyz coordinates
+        k: Number of neighbors for local neighborhood
+        chunk_size: Target points per chunk (default: 500K)
+        overlap_factor: Overlap between chunks (default: 0.15)
+        n_jobs: Number of parallel workers (default: 2)
+    
+    Returns:
+        Tuple of:
+        - normals: (N, 3) surface normals (unit length, float32)
+        - curvatures: (N,) curvature values
+    """
+    n_points = points.shape[0]
+    
+    if n_points < 3:
+        return np.zeros((n_points, 3), dtype=np.float32), np.zeros(n_points, dtype=np.float32)
+    
+    print(f"  Parallel Chunked Normal Estimation (CPU, n_jobs={n_jobs})")
+    print(f"    Total points: {n_points:,}, k={k}, chunk_size={chunk_size:,}")
+    
+    # Partition into spatial chunks
+    chunks = partition_point_cloud_spatial(points, chunk_size, overlap_factor)
+    n_chunks = len(chunks)
+    print(f"    Number of chunks: {n_chunks}")
+    
+    # Assert: All points should be covered by chunks
+    covered_indices = set()
+    for chunk in chunks:
+        covered_indices.update(chunk['indices'])
+    assert len(covered_indices) == n_points, f"Chunk coverage error: {len(covered_indices)}/{n_points} points covered"
+    
+    # Prepare arguments for parallel processing
+    chunk_args = [(chunk['points'], chunk['indices'], k) for chunk in chunks]
+    
+    # Process chunks in parallel using joblib
+    try:
+        from joblib import Parallel, delayed
+        print(f"    Processing {n_chunks} chunks with {n_jobs} workers...")
+        results = Parallel(n_jobs=n_jobs, verbose=1)(
+            delayed(_process_chunk_cpu)(args) for args in chunk_args
+        )
+    except ImportError:
+        print(f"    joblib not available, processing sequentially...")
+        results = [_process_chunk_cpu(args) for args in chunk_args]
+    
+    # Combine results
+    normals = np.zeros((n_points, 3), dtype=np.float32)
+    curvatures = np.zeros(n_points, dtype=np.float32)
+    
+    for chunk_normals, chunk_curvatures, global_indices in results:
+        normals[global_indices] = chunk_normals
+        curvatures[global_indices] = chunk_curvatures
+    
+    print(f"    Completed {n_chunks} chunks")
+    
+    # Assert: All normals should be computed (no zero normals)
+    zero_normals = np.where(np.all(normals == 0, axis=1))[0]
+    if len(zero_normals) > 0:
+        print(f"    Warning: {len(zero_normals)} points have zero normals")
+    
+    # Assert: Output shape matches input
+    assert normals.shape[0] == n_points, f"Output normals shape mismatch: {normals.shape[0]} vs {n_points}"
+    assert curvatures.shape[0] == n_points, f"Output curvatures shape mismatch: {curvatures.shape[0]} vs {n_points}"
+    
+    return normals, curvatures
+
+
 def estimate_normals_knn(points: np.ndarray,
                          k: int = 10,
                          batch_size: int = 100000,
                          workers: int = 1,
-                         use_gpu: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                         use_gpu: bool = True,
+                         use_chunked: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
     Estimate surface normals using K-Nearest Neighbors.
     
     Automatically selects the best available method:
-    1. GPU (PyTorch) - fastest for NVIDIA GPUs
-    2. Vectorized CPU - faster than loop-based
-    3. Legacy loop-based - fallback for compatibility
-    
-    For each point, finds k nearest neighbors, computes PCA of local
-    neighborhood, and uses the smallest eigenvector as normal direction.
+    1. Chunked GPU - for large datasets (>1M points)
+    2. GPU (PyTorch) - for medium datasets
+    3. Vectorized CPU - fallback
+    4. Legacy loop-based - compatibility
     
     Args:
         points: (N, 3) xyz coordinates
         k: Number of neighbors for local neighborhood (default: 10, capped at 20 for GPU)
-        batch_size: Points to process per batch (default: 100,000 for CPU, 500,000 for GPU)
-        workers: Number of parallel workers for KDTree query (default: 1, use -1 for all CPUs)
+        batch_size: Points per batch for non-chunked methods
+        workers: Number of parallel workers
         use_gpu: Whether to use GPU if available (default: True)
+        use_chunked: Use chunked approach for large datasets (default: True)
         
     Returns:
         Tuple of:
@@ -334,13 +662,69 @@ def estimate_normals_knn(points: np.ndarray,
     # Auto-select best method based on availability
     device = get_device() if use_gpu else 'cpu'
     
+    # Use chunked approach for large datasets
+    CHUNK_THRESHOLD = 1_000_000  # Use chunked for > 1M points
+    
+    if use_chunked and n_points >= CHUNK_THRESHOLD and HAS_TORCH:
+        print(f"  Using chunked normal estimation")
+        return estimate_normals_chunked(points, k=k, device=device)
+    
     # Try GPU first if requested and available
     if use_gpu and device != 'cpu' and HAS_TORCH:
         print(f"  Using GPU acceleration ({device})")
         try:
-            # Use larger batch size for GPU
-            gpu_batch_size = min(batch_size * 5, 500000)
-            return estimate_normals_gpu(points, k=k, batch_size=gpu_batch_size, device=device)
+            # GPU batch size calculation - adaptive based on k and available memory
+            # Memory formula: ~100 * batch_size * (k+1) bytes
+            # For RTX 3060 (6GB), conservatively use ~4GB max
+            MAX_GPU_BATCH = 2_000_000  # Absolute maximum
+            MIN_GPU_BATCH = 100_000     # Minimum batch size
+            MEMORY_BUDGET_GB = 4.0       # Conservative 4GB for computation
+            
+            # Base: 100 * batch_size * (k+1) bytes = 100 * batch_size * (k+1) / 1e9 GB
+            max_by_k = int(MEMORY_BUDGET_GB * 1e9 / (100 * (k + 1)))
+            
+            # Scale down for very large point clouds (more memory pressure)
+            if n_points > 5_000_000:
+                max_by_k = int(max_by_k * 0.5)
+            elif n_points > 2_000_000:
+                max_by_k = int(max_by_k * 0.7)
+            
+            # Apply limits
+            gpu_batch_size = min(max_by_k, MAX_GPU_BATCH)
+            gpu_batch_size = max(gpu_batch_size, MIN_GPU_BATCH)
+            
+            # User can override with explicit batch_size parameter
+            if batch_size < n_points:
+                gpu_batch_size = min(batch_size * 20, gpu_batch_size)
+            
+            print(f"    Adaptive GPU batch size: {gpu_batch_size:,} (k={k}, n_points={n_points:,})")
+            
+            # Try GPU with adaptive batch size, with retry on OOM
+            retry_count = 0
+            max_retries = 3
+            current_batch = gpu_batch_size
+            
+            while retry_count < max_retries:
+                try:
+                    return estimate_normals_gpu(points, k=k, batch_size=current_batch, device=device)
+                except RuntimeError as e:
+                    if 'out of memory' in str(e).lower() or 'oom' in str(e).lower():
+                        retry_count += 1
+                        old_batch = current_batch
+                        current_batch = max(MIN_GPU_BATCH, current_batch // 2)
+                        print(f"    GPU OOM: reducing batch from {old_batch:,} to {current_batch:,} (retry {retry_count}/{max_retries})")
+                        # Clear GPU memory
+                        if HAS_TORCH and device == 'cuda':
+                            import torch
+                            torch.cuda.empty_cache()
+                        if current_batch <= MIN_GPU_BATCH:
+                            print(f"    GPU batch size too small, falling back to CPU...")
+                            break
+                    else:
+                        raise
+            
+            # Fallback to CPU if GPU failed after retries
+            print(f"    Falling back to vectorized CPU...")
         except Exception as e:
             print(f"    GPU computation failed: {e}")
             print(f"    Falling back to vectorized CPU...")
