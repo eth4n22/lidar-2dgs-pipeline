@@ -171,14 +171,14 @@ def estimate_normals_chunked(points: np.ndarray,
         
         # GPU PCA computation
         if HAS_TORCH and device != 'cpu':
-            # Get neighbors
+            # Get neighbors - indices stay on CPU, move to GPU only once
             neighbor_indices = torch.from_numpy(local_indices[:, 1:]).long()
             if device == 'cuda':
                 neighbor_indices = neighbor_indices.cuda()
-                points_gpu = points_gpu.cuda()
+                # points_gpu already on GPU from line 164, no need to recuda
             elif device == 'mps':
                 neighbor_indices = neighbor_indices.to('mps')
-                points_gpu = points_gpu.to('mps')
+                # points_gpu already on MPS from line 166
             
             neighbors = points_gpu[neighbor_indices]
             
@@ -367,16 +367,20 @@ def estimate_normals_gpu(points: np.ndarray,
         total_eig = eigenvalues.sum(dim=1)  # (batch_n,)
         batch_curvatures = eigenvalues[:, 0] / (total_eig + 1e-10)
         
-        # Ensure normals point away from origin
-        batch_points_np = points[start:end]
+        # Ensure normals point away from origin - do on GPU to avoid CPU->GPU->CPU cycle
+        batch_points_gpu = points_gpu[start:end]
+        dot_products_gpu = torch.sum(batch_normals * batch_points_gpu, dim=1, keepdims=True)
+        flip_mask = dot_products_gpu < 0
+        # Flip normals where dot product is negative
+        batch_normals = torch.where(flip_mask.expand_as(batch_normals), -batch_normals, batch_normals)
+        
+        # Transfer to CPU once for storage
         batch_normals_np = batch_normals.cpu().numpy()
-        dot_products = np.sum(batch_normals_np * batch_points_np, axis=1, keepdims=True)
-        flip_mask = dot_products < 0
-        batch_normals_np[flip_mask.flatten()] *= -1
+        batch_curvatures_np = batch_curvatures.cpu().numpy()
         
         # Store results
-        normals[start:end] = batch_normals_np.astype(np.float32)
-        curvatures[start:end] = batch_curvatures.cpu().numpy().astype(np.float32)
+        normals[start:end] = batch_normals_np
+        curvatures[start:end] = batch_curvatures_np
         
         # Cleanup GPU memory
         del neighbors, centered, cov, eigenvalues, eigenvectors, batch_normals
@@ -675,33 +679,36 @@ def estimate_normals_knn(points: np.ndarray,
     if use_gpu and device != 'cpu' and HAS_TORCH:
         print(f"  Using GPU acceleration ({device})")
         try:
-            # GPU batch size calculation - adaptive based on k and available memory
-            # Memory formula: ~100 * batch_size * (k+1) bytes
-            # For RTX 3060 (6GB), conservatively use ~4GB max
-            MAX_GPU_BATCH = 2_000_000  # Absolute maximum
+            # GPU batch size calculation based on actual GPU memory
             MIN_GPU_BATCH = 100_000     # Minimum batch size
-            MEMORY_BUDGET_GB = 4.0       # Conservative 4GB for computation
+            MAX_GPU_BATCH = 1_000_000   # Reduced maximum for safety
+            SAFETY_MARGIN = 0.30         # Use only 30% of free memory (very conservative)
             
-            # Base: 100 * batch_size * (k+1) bytes = 100 * batch_size * (k+1) / 1e9 GB
-            max_by_k = int(MEMORY_BUDGET_GB * 1e9 / (100 * (k + 1)))
+            # Query actual GPU memory
+            if device == 'cuda':
+                import torch
+                # torch.cuda.mem_get_info() returns (free, total)
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                # Use very conservative estimate: 30% of free memory
+                available_mem = free_mem * SAFETY_MARGIN
+                print(f"[GPU] Total: {total_mem/1e9:.2f}GB, Free: {free_mem/1e9:.2f}GB, Using 30%: {available_mem/1e9:.2f}GB")
+            else:
+                available_mem = 4.0 * 1e9  # Default for non-cuda devices
             
-            # Scale down for very large point clouds (more memory pressure)
-            if n_points > 5_000_000:
-                max_by_k = int(max_by_k * 0.5)
-            elif n_points > 2_000_000:
-                max_by_k = int(max_by_k * 0.7)
+            # Memory calculation for GPU processing:
+            # The ENTIRE point cloud is on GPU (n * 12 bytes)
+            # Plus per-batch: neighbors (n*k*12), covariance (n*36), eigenvectors (n*36)
+            # Conservative estimate: ~200 bytes per point for batch processing
+            BYTES_PER_POINT = 200  # Conservative estimate for k=10
+            max_by_memory = int(available_mem / BYTES_PER_POINT)
             
             # Apply limits
-            gpu_batch_size = min(max_by_k, MAX_GPU_BATCH)
+            gpu_batch_size = min(max_by_memory, MAX_GPU_BATCH)
             gpu_batch_size = max(gpu_batch_size, MIN_GPU_BATCH)
             
-            # User can override with explicit batch_size parameter
-            if batch_size < n_points:
-                gpu_batch_size = min(batch_size * 20, gpu_batch_size)
+            print(f"[GPU] Using batch size: {gpu_batch_size:,} (k={k}, n_points={n_points:,})")
             
-            print(f"    Adaptive GPU batch size: {gpu_batch_size:,} (k={k}, n_points={n_points:,})")
-            
-            # Try GPU with adaptive batch size, with retry on OOM
+            # Try GPU with computed batch size, with retry on OOM (fallback)
             retry_count = 0
             max_retries = 3
             current_batch = gpu_batch_size
@@ -717,7 +724,6 @@ def estimate_normals_knn(points: np.ndarray,
                         print(f"    GPU OOM: reducing batch from {old_batch:,} to {current_batch:,} (retry {retry_count}/{max_retries})")
                         # Clear GPU memory
                         if HAS_TORCH and device == 'cuda':
-                            import torch
                             torch.cuda.empty_cache()
                         if current_batch <= MIN_GPU_BATCH:
                             print(f"    GPU batch size too small, falling back to CPU...")
