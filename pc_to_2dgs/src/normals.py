@@ -662,11 +662,13 @@ def estimate_normals_knn(points: np.ndarray,
     # Auto-select best method based on availability
     device = get_device() if use_gpu else 'cpu'
     
-    # Use chunked approach for large datasets
-    CHUNK_THRESHOLD = 1_000_000  # Use chunked for > 1M points
+    # Use chunked approach only for very large datasets (>20M points)
+    # Below this threshold, use the faster GPU method which processes
+    # all points in a single pass with batched processing
+    CHUNK_THRESHOLD = 20_000_000  # Use chunked for > 20M points
     
     if use_chunked and n_points >= CHUNK_THRESHOLD and HAS_TORCH:
-        print(f"  Using chunked normal estimation")
+        print(f"  Using chunked normal estimation (GPU)")
         return estimate_normals_chunked(points, k=k, device=device)
     
     # Try GPU first if requested and available
