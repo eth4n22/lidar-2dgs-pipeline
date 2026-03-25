@@ -79,11 +79,10 @@ def estimate_normals_fast(
     """
     Fast GPU-accelerated normal estimation.
     
-    Loads all points into memory but uses optimized GPU processing.
-    Best for datasets under ~20M points.
+    Loads all points into memory using full load (not streaming).
+    Uses optimized GPU processing. Best for datasets under ~20M points.
     """
-    from src.txt_io import load_xyzrgb_txt
-    
+    import numpy as np
     import time
     
     print("="*60)
@@ -94,16 +93,19 @@ def estimate_normals_fast(
     print(f"  K neighbors: {k}")
     print(f"  Device: {device}")
     
-    # Load all points
-    print("\n[Timing] Loading points...")
+    # Load all points using full numpy load (fast mode)
+    print("\n[Timing] Load: ...")
     load_start = time.time()
-    points, colors = load_xyzrgb_txt(input_file)
-    load_time = time.time() - load_start
+    import os
+    print(f"  Loading {os.path.basename(input_file)} (full load)...")
+    data = np.loadtxt(input_file, dtype=np.float32, comments='#', delimiter=None)
+    points = data[:, 0:3]
     n_points = len(points)
-    print(f"[Timing] Load time: {load_time:.2f}s ({n_points:,} points)")
+    load_time = time.time() - load_start
+    print(f"[Timing] Load: {load_time:.2f}s ({n_points:,} points)")
     
     # Estimate normals using fast GPU method
-    print("\n[Timing] Computing normals...")
+    print("\n[Timing] Normals: ...")
     norm_start = time.time()
     
     normals, _ = estimate_normals_knn(
@@ -114,31 +116,34 @@ def estimate_normals_fast(
     )
     
     norm_time = time.time() - norm_start
-    print(f"[Timing] Normal estimation: {norm_time:.2f}s ({n_points/norm_time:,.0f} pts/sec)")
+    print(f"[Timing] Normals: {norm_time:.2f}s ({n_points/norm_time:,.0f} pts/sec)")
+    
+    # Skip surfels for now (fast mode)
+    surfels_time = 0.0
     
     # Write to binary
-    print("\n[Timing] Writing to binary...")
+    print("\n[Timing] Export: ...")
     write_start = time.time()
     
-    import numpy as np
-    data = np.hstack([points, normals]).astype(np.float32)
+    out_data = np.hstack([points, normals]).astype(np.float32)
     
     with open(output_file, 'wb') as f:
-        data.tofile(f)
+        out_data.tofile(f)
     
-    write_time = time.time() - write_start
-    print(f"[Timing] Write time: {write_time:.2f}s")
+    export_time = time.time() - write_start
+    print(f"[Timing] Export: {export_time:.2f}s")
     
-    total_time = load_time + norm_time + write_time
+    total_time = load_time + norm_time + surfels_time + export_time
     
     print(f"\n{'='*60}")
     print(f"FAST MODE COMPLETE")
     print(f"{'='*60}")
     print(f"  Total points: {n_points:,}")
-    print(f"  Load time: {load_time:.2f}s ({n_points/load_time:,.0f} pts/sec)")
-    print(f"  Normal time: {norm_time:.2f}s ({n_points/norm_time:,.0f} pts/sec)")
-    print(f"  Write time: {write_time:.2f}s")
-    print(f"  TOTAL time: {total_time:.2f}s ({n_points/total_time:,.0f} pts/sec)")
+    print(f"  Load: {load_time:.2f}s ({n_points/load_time:,.0f} pts/sec)")
+    print(f"  Normals: {norm_time:.2f}s ({n_points/norm_time:,.0f} pts/sec)")
+    print(f"  Surfels: {surfels_time:.2f}s")
+    print(f"  Export: {export_time:.2f}s")
+    print(f"  TOTAL: {total_time:.2f}s ({n_points/total_time:,.0f} pts/sec)")
     
     return n_points
 

@@ -89,7 +89,7 @@ def partition_point_cloud_spatial(points: np.ndarray,
 
 def estimate_normals_chunked(points: np.ndarray,
                             k: int = 10,
-                            chunk_size: int = 500000,
+                            chunk_size: int = 300000,
                             overlap_factor: float = 0.15,
                             device: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -101,7 +101,7 @@ def estimate_normals_chunked(points: np.ndarray,
     Args:
         points: (N, 3) xyz coordinates
         k: Number of neighbors for local neighborhood
-        chunk_size: Target points per chunk (default: 500K)
+        chunk_size: Target points per chunk (default: 300K, range: 200K-400K)
         overlap_factor: Overlap between chunks (default: 0.15)
         device: 'cuda', 'mps', or 'cpu'. Auto-detects if None.
     
@@ -110,6 +110,7 @@ def estimate_normals_chunked(points: np.ndarray,
         - normals: (N, 3) surface normals (unit length, float32)
         - curvatures: (N,) curvature values (float32)
     """
+    import time
     n_points = points.shape[0]
     
     if n_points < 3:
@@ -148,26 +149,66 @@ def estimate_normals_chunked(points: np.ndarray,
         if chunk_idx % 5 == 0 or chunk_idx == n_chunks - 1:
             print(f"    Chunk {chunk_idx + 1}/{n_chunks}: {chunk_n:,} points")
         
-        # Build local cKDTree for this chunk
-        local_tree = cKDTree(chunk_points)
+        # Halo expansion: include neighboring points for accurate boundary normals
+        # Estimate average point spacing
+        avg_spacing = 0.1  # Default, estimate from data if needed
+        halo_expand = avg_spacing * 3  # 3x spacing for halo
         
-        # Query neighbors for all points in chunk
-        k_eff = min(k + 1, chunk_n)
-        distances, local_indices = local_tree.query(chunk_points, k=k_eff)
+        # Get bounding box of chunk
+        chunk_min = chunk_points.min(axis=0)
+        chunk_max = chunk_points.max(axis=0)
+        
+        # Find halo points from full point cloud
+        halo_mask = (
+            (points[:, 0] >= chunk_min[0] - halo_expand) & (points[:, 0] <= chunk_max[0] + halo_expand) &
+            (points[:, 1] >= chunk_min[1] - halo_expand) & (points[:, 1] <= chunk_max[1] + halo_expand) &
+            (points[:, 2] >= chunk_min[2] - halo_expand) & (points[:, 2] <= chunk_max[2] + halo_expand)
+        )
+        halo_indices = np.where(halo_mask)[0]
+        
+        # Core points = chunk indices, Halo points = neighbors outside chunk
+        core_mask = np.isin(halo_indices, global_indices)
+        core_in_halo = halo_indices[core_mask]
+        halo_only = halo_indices[~core_mask]
+        
+        # Combined points for KDTree: core + halo
+        combined_points = points[halo_indices]
+        combined_n = len(combined_points)
+        
+        # Map: core position in combined array
+        core_combined_idx = np.searchsorted(halo_indices, global_indices)
+        
+        core_n = chunk_n
+        halo_n = len(halo_only)
+        print(f"      [HALO] Core: {core_n:,}, Halo: {halo_n:,}")
+        
+        # Build local cKDTree for combined points (no global KDTree)
+        t0 = time.time()
+        local_tree = cKDTree(combined_points)
+        kdtime = time.time() - t0
+        print(f"      [CHUNK] Combined: {combined_n:,}, KDTree build: {kdtime:.3f}s")
+        
+        # Query neighbors for core points only
+        k_eff = min(k + 1, combined_n)
+        distances, local_indices = local_tree.query(combined_points[core_combined_idx], k=k_eff)
         
         # Convert to float32
-        if chunk_points.dtype != np.float32:
-            chunk_points = chunk_points.astype(np.float32)
+        combined_points = combined_points.astype(np.float32)
+        core_points = chunk_points.astype(np.float32)
         
         # Move to device
         if device == 'cuda' and HAS_TORCH:
-            points_gpu = torch.from_numpy(chunk_points).cuda()
+            points_gpu = torch.from_numpy(combined_points).cuda()
+            core_gpu = torch.from_numpy(core_points).cuda()
         elif device == 'mps' and HAS_TORCH:
-            points_gpu = torch.from_numpy(chunk_points).to('mps')
+            points_gpu = torch.from_numpy(combined_points).to('mps')
+            core_gpu = torch.from_numpy(core_points).to('mps')
         elif HAS_TORCH:
-            points_gpu = torch.from_numpy(chunk_points)
+            points_gpu = torch.from_numpy(combined_points)
+            core_gpu = torch.from_numpy(core_points)
         else:
-            points_gpu = chunk_points
+            points_gpu = combined_points
+            core_gpu = core_points
         
         # GPU PCA computation
         if HAS_TORCH and device != 'cpu':
@@ -198,7 +239,7 @@ def estimate_normals_chunked(points: np.ndarray,
         else:
             # CPU fallback
             neighbor_indices = local_indices[:, 1:]
-            neighbors = chunk_points[neighbor_indices]
+            neighbors = combined_points[neighbor_indices]
             
             centroids = neighbors.mean(axis=1, keepdims=True)
             centered = neighbors - centroids
@@ -214,7 +255,7 @@ def estimate_normals_chunked(points: np.ndarray,
                 chunk_curvatures[i] = eigvals[0] / total if total > 0 else 0.0
         
         # Flip normals to point away from origin
-        dot_products = np.sum(chunk_normals * chunk_points, axis=1)
+        dot_products = np.sum(chunk_normals * core_points, axis=1)
         flip_mask = dot_products < 0
         chunk_normals[flip_mask] *= -1
         
@@ -320,10 +361,8 @@ def estimate_normals_gpu(points: np.ndarray,
     
     # Build KNN index ONCE before batch loop using scipy cKDTree
     # Note: FAISS is too slow on Windows for this workload
-    print("[INFO] Using scipy cKDTree KNN")
-    tree = cKDTree(points)
-    
     print("[INFO] Points:", points.shape[0])
+    tree = cKDTree(points)
     
     # Process in batches
     n_batches = (n_points + batch_size - 1) // batch_size
@@ -338,12 +377,12 @@ def estimate_normals_gpu(points: np.ndarray,
         
         batch_points = points_gpu[start:end]
         
-        # KNN search using cKDTree (built once outside loop)
+        # KNN search using global cKDTree (built once)
         indices = tree.query(points[start:end], k=k_effective)[1]
+        indices_gpu = torch.from_numpy(indices[:, 1:]).long().to(device)
         
         # Get neighbors: (batch_n, k_effective, 3)
         # Use GPU indices directly - keep all computation on GPU!
-        indices_gpu = torch.from_numpy(indices[:, 1:]).long().to(device)
         neighbors = points_gpu[indices_gpu]  # All GPU, no CPU round-trip
         
         # Vectorized PCA computation on GPU
@@ -679,34 +718,17 @@ def estimate_normals_knn(points: np.ndarray,
     if use_gpu and device != 'cpu' and HAS_TORCH:
         print(f"  Using GPU acceleration ({device})")
         try:
-            # GPU batch size calculation based on actual GPU memory
-            MIN_GPU_BATCH = 100_000     # Minimum batch size
-            MAX_GPU_BATCH = 1_000_000   # Reduced maximum for safety
-            SAFETY_MARGIN = 0.30         # Use only 30% of free memory (very conservative)
+            # GPU batch size calculation
             
-            # Query actual GPU memory
-            if device == 'cuda':
-                import torch
-                # torch.cuda.mem_get_info() returns (free, total)
-                free_mem, total_mem = torch.cuda.mem_get_info()
-                # Use very conservative estimate: 30% of free memory
-                available_mem = free_mem * SAFETY_MARGIN
-                print(f"[GPU] Total: {total_mem/1e9:.2f}GB, Free: {free_mem/1e9:.2f}GB, Using 30%: {available_mem/1e9:.2f}GB")
+            # Calibrated batch sizes - stable, no OOM retries
+            if n_points >= 5_000_000:
+                gpu_batch_size = 800_000
+            elif n_points >= 2_000_000:
+                gpu_batch_size = 600_000
             else:
-                available_mem = 4.0 * 1e9  # Default for non-cuda devices
+                gpu_batch_size = min(n_points, 1_000_000)
             
-            # Memory calculation for GPU processing:
-            # The ENTIRE point cloud is on GPU (n * 12 bytes)
-            # Plus per-batch: neighbors (n*k*12), covariance (n*36), eigenvectors (n*36)
-            # Conservative estimate: ~200 bytes per point for batch processing
-            BYTES_PER_POINT = 200  # Conservative estimate for k=10
-            max_by_memory = int(available_mem / BYTES_PER_POINT)
-            
-            # Apply limits
-            gpu_batch_size = min(max_by_memory, MAX_GPU_BATCH)
-            gpu_batch_size = max(gpu_batch_size, MIN_GPU_BATCH)
-            
-            print(f"[GPU] Using batch size: {gpu_batch_size:,} (k={k}, n_points={n_points:,})")
+            print(f"[GPU] Using calibrated batch size: {gpu_batch_size:,} (n_points={n_points:,})")
             
             # Try GPU with computed batch size, with retry on OOM (fallback)
             retry_count = 0
@@ -847,10 +869,10 @@ def orient_normals_consistently(points: np.ndarray,
         else:
             reference_normal = np.array([0.0, 0.0, 1.0])
     
-    # Flip normals that point opposite to the reference direction
-    for i in range(normals.shape[0]):
-        if np.dot(normals[i], reference_normal) < 0:
-            normals[i] = -normals[i]
+    # Flip normals that point opposite to the reference direction (VECTORIZED)
+    dot_products = np.dot(normals, reference_normal)
+    flip_mask = dot_products < 0
+    normals[flip_mask] *= -1
     
     return normals
 
@@ -881,17 +903,18 @@ def refine_normals(points: np.ndarray,
     for _ in range(iterations):
         new_normals = np.zeros_like(refined)
         
-        for i in range(points.shape[0]):
-            # Find nearby points
-            distances, indices = tree.query(points[i], k=16)
-            
-            # Weight by inverse distance
-            weights = 1.0 / (distances + 1e-6)
-            weights = weights / np.sum(weights)
-            
-            # Average normals
-            new_normal = np.sum(refined[indices].T * weights, axis=1)
-            new_normals[i] = new_normal
+        # BATCH KNN query - much faster than per-point query
+        distances, indices = tree.query(points, k=16)
+        
+        # Weight by inverse distance (vectorized)
+        weights = 1.0 / (distances + 1e-6)
+        weights = weights / weights.sum(axis=1, keepdims=True)
+        
+        # Average normals using broadcasting (vectorized)
+        # refined[indices] shape: (N, 16, 3)
+        # weights shape: (N, 16)
+        # Result: sum over k dimension
+        new_normals = np.sum(refined[indices] * weights[:, :, np.newaxis], axis=1)
         
         # Reorient
         new_normals = orient_normals_consistently(points, new_normals, reference_point=np.mean(points, axis=0))

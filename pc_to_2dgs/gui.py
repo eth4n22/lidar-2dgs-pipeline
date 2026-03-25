@@ -693,10 +693,37 @@ class ConverterGUI:
         current_stage_idx = 0
         
         try:
-            update_stage("Loading...", 5)
-            print(f"Loading: {input_file.name}")
-            points, colors = load_xyzrgb_txt(str(input_file))
-            print(f"Loaded {points.shape[0]} points")
+            # Mode selection: same logic as CLI
+            CHUNK_THRESHOLD = 20_000_000
+            
+            # For fast mode: load directly without pre-counting (single I/O)
+            # For chunked mode: count first, then stream
+            update_stage("Loading...", 10)
+            
+            # Check file size to estimate if chunked might be needed
+            import os
+            file_size_mb = os.path.getsize(str(input_file)) / (1024 * 1024)
+            
+            # Use file size heuristic: ~30 bytes per point estimate
+            estimated_points = int(file_size_mb * 1024 * 1024 / 30)
+            use_chunked = estimated_points >= CHUNK_THRESHOLD
+            mode = "chunked" if use_chunked else "fast"
+            
+            if mode == "fast":
+                print(f"[LOAD] Fast mode: skipping pre-count, loading directly")
+                import numpy as np
+                data = np.loadtxt(str(input_file), dtype=np.float32, comments='#', delimiter=None)
+                points = data[:, 0:3]
+                colors = (data[:, 3:6]).astype(np.uint8)
+            else:
+                print(f"[LOAD] Using streaming loading (chunked mode)")
+                from src.txt_io import StreamingTXTReader
+                reader = StreamingTXTReader(str(input_file), chunk_size=1000000)
+                point_count = reader.total_points
+                print(f"[LOAD] Total points: {point_count:,}")
+                points, colors = load_xyzrgb_txt(str(input_file))
+            
+            print(f"[LOAD] Loaded {points.shape[0]} points")
             
             update_stage("Preprocessing...", 20)
             print("\n[Preprocessing]")
@@ -715,9 +742,11 @@ class ConverterGUI:
                 print(f"After voxel downsampling: {points.shape[0]} points")
                 
             update_stage("Computing normals...", 45)
-            print("\n[Normals]")
+            print("\n[NORMALS]")
             k_normal = min(knn, max(3, points.shape[0] - 1))
-            normals, curvatures = estimate_normals_knn(points, k=k_normal)
+            print(f"[MODE] Using: {mode} (points={points.shape[0]:,}, threshold={CHUNK_THRESHOLD:,})")
+            
+            normals, curvatures = estimate_normals_knn(points, k=k_normal, use_chunked=use_chunked)
             normals = orient_normals_consistently(points, normals)
             print(f"Estimated {normals.shape[0]} normals")
             
