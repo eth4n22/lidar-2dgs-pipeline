@@ -89,10 +89,10 @@ def test_baseline_comparison(points):
     
     points_subset = points[:n_points]
     
-    # Non-chunked method (may use GPU)
-    print("\n  Non-chunked method:")
+    # FAST mode (no chunking, no halo)
+    print("\n  FAST mode:")
     start = time.time()
-    normals1, _ = estimate_normals_knn(points_subset, k=10, use_chunked=False)
+    normals1, _ = estimate_normals_knn(points_subset, k=10)
     t1 = time.time() - start
     print(f"    Runtime: {t1:.2f}s")
     print(f"    Points/sec: {n_points/t1:,.0f}")

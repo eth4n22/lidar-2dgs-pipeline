@@ -377,6 +377,16 @@ class ConverterGUI:
                                          cursor='hand2')
         self.outliers_cb.pack(anchor=tk.W, padx=4)
         
+        self.halo_var = tk.BooleanVar(value=False)  # Default: fast mode (no halo)
+        self.halo_cb = tk.Checkbutton(checkbox_frame, text="Accurate Mode (Halo + Spatial)",
+                                     variable=self.halo_var,
+                                     bg=COLORS['card_bg'], fg=COLORS['text'],
+                                     selectcolor=COLORS['card_bg'],
+                                     activebackground=COLORS['card_bg'],
+                                     font=('Segoe UI', 9),
+                                     cursor='hand2')
+        self.halo_cb.pack(anchor=tk.W, padx=4)
+        
         # Run Card
         self.create_card(left_column, "Run")
         run_frame = self.current_card
@@ -660,16 +670,17 @@ class ConverterGUI:
         knn = int(self.param_entries["KNN Normals:"].get())
         refine = int(self.param_entries["Refine Iterations:"].get())
         remove_outliers = self.outliers_var.get()
+        use_halo = self.halo_var.get()
         binary = self.format_toggle.get_selected() == "Binary"
         
         # Start thread
         thread = threading.Thread(
             target=self.run_conversion,
-            args=(self.selected_input_file, voxel_size, knn, refine, remove_outliers, binary)
+            args=(self.selected_input_file, voxel_size, knn, refine, remove_outliers, binary, use_halo)
         )
         thread.start()
         
-    def run_conversion(self, input_file, voxel_size, knn, refine, remove_outliers, binary):
+    def run_conversion(self, input_file, voxel_size, knn, refine, remove_outliers, binary, use_halo=False):
         """Run the conversion process."""
         # Capture output with progress callback
         old_stdout = sys.stdout
@@ -693,30 +704,26 @@ class ConverterGUI:
         current_stage_idx = 0
         
         try:
-            # Mode selection: same logic as CLI
-            CHUNK_THRESHOLD = 20_000_000
-            
-            # For fast mode: load directly without pre-counting (single I/O)
-            # For chunked mode: count first, then stream
             update_stage("Loading...", 10)
             
-            # Check file size to estimate if chunked might be needed
-            import os
-            file_size_mb = os.path.getsize(str(input_file)) / (1024 * 1024)
+            # Mode selection: user checkbox ONLY determines behavior
+            print(f"[GUI] Halo enabled: {use_halo}")
             
-            # Use file size heuristic: ~30 bytes per point estimate
-            estimated_points = int(file_size_mb * 1024 * 1024 / 30)
-            use_chunked = estimated_points >= CHUNK_THRESHOLD
-            mode = "chunked" if use_chunked else "fast"
+            if use_halo:
+                mode = "spatial_streaming"
+                print(f"[MODE] Using: {mode}")
+            else:
+                mode = "fast"
+                print(f"[MODE] Using: {mode}")
             
             if mode == "fast":
-                print(f"[LOAD] Fast mode: skipping pre-count, loading directly")
+                print(f"[LOAD] Fast mode: loading directly")
                 import numpy as np
                 data = np.loadtxt(str(input_file), dtype=np.float32, comments='#', delimiter=None)
                 points = data[:, 0:3]
                 colors = (data[:, 3:6]).astype(np.uint8)
             else:
-                print(f"[LOAD] Using streaming loading (chunked mode)")
+                print(f"[LOAD] Spatial mode: using streaming")
                 from src.txt_io import StreamingTXTReader
                 reader = StreamingTXTReader(str(input_file), chunk_size=1000000)
                 point_count = reader.total_points
@@ -744,9 +751,14 @@ class ConverterGUI:
             update_stage("Computing normals...", 45)
             print("\n[NORMALS]")
             k_normal = min(knn, max(3, points.shape[0] - 1))
-            print(f"[MODE] Using: {mode} (points={points.shape[0]:,}, threshold={CHUNK_THRESHOLD:,})")
+            print(f"[MODE] Using: {mode} (points={points.shape[0]:,})")
             
-            normals, curvatures = estimate_normals_knn(points, k=k_normal, use_chunked=use_chunked)
+            # Route to correct normals estimation based on mode
+            from src.normals import estimate_normals_knn, estimate_normals_chunked
+            if mode == "spatial_streaming":
+                normals, curvatures = estimate_normals_chunked(points, k=k_normal)
+            else:
+                normals, curvatures = estimate_normals_knn(points, k=k_normal)
             normals = orient_normals_consistently(points, normals)
             print(f"Estimated {normals.shape[0]} normals")
             

@@ -32,13 +32,6 @@ from src.spatial_partition import (
 )
 
 
-# Threshold for switching to streaming mode (20M points)
-STREAMING_THRESHOLD = 20_000_000
-
-# Threshold for spatial_streaming mode (50M points)
-SPATIAL_THRESHOLD = 50_000_000
-
-
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -104,15 +97,14 @@ def estimate_normals_fast(
     load_time = time.time() - load_start
     print(f"[Timing] Load: {load_time:.2f}s ({n_points:,} points)")
     
-    # Estimate normals using fast GPU method
+    # Estimate normals using fast GPU method (no chunking, no halo)
     print("\n[Timing] Normals: ...")
     norm_start = time.time()
     
     normals, _ = estimate_normals_knn(
         points,
         k=k,
-        use_gpu=True,
-        use_chunked=True
+        use_gpu=True
     )
     
     norm_time = time.time() - norm_start
@@ -300,16 +292,10 @@ def estimate_normals_hybrid(
     print("\n  Counting points in input file...")
     n_points = count_points(input_file)
     
-    # Determine mode
+    # Determine mode - use explicit mode, no auto threshold switching
+    selected_mode = mode
     if mode == "auto":
-        if n_points >= SPATIAL_THRESHOLD:
-            selected_mode = "spatial_streaming"
-        elif n_points >= STREAMING_THRESHOLD:
-            selected_mode = "streaming"
-        else:
-            selected_mode = "fast"
-    else:
-        selected_mode = mode
+        selected_mode = "fast"  # Default to fast if auto
     
     print(f"\n[MODE] Using: {selected_mode}")
     print(f"[MODE] Dataset size: {n_points:,} points")

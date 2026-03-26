@@ -41,3 +41,7 @@ data/output/*
 
 # OS
 Thumbs.db
+
+# Binary outputs
+*.bin
+output.bin

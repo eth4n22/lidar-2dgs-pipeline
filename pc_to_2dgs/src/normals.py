@@ -93,8 +93,9 @@ def estimate_normals_chunked(points: np.ndarray,
                             overlap_factor: float = 0.15,
                             device: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Chunked normal estimation for very large point clouds.
+    Chunked normal estimation for very large point clouds (SPATIAL mode).
     
+    This is the SPATIAL mode - includes halo for boundary handling.
     Partitions point cloud into spatial chunks and processes each independently.
     This reduces memory usage and allows processing of 100M+ point clouds.
     
@@ -111,6 +112,8 @@ def estimate_normals_chunked(points: np.ndarray,
         - curvatures: (N,) curvature values (float32)
     """
     import time
+    print(f"[NORMALS] Mode: spatial (halo enabled)")
+    
     n_points = points.shape[0]
     
     if n_points < 3:
@@ -137,6 +140,14 @@ def estimate_normals_chunked(points: np.ndarray,
     normals = np.zeros((n_points, 3), dtype=np.float32)
     curvatures = np.zeros(n_points, dtype=np.float32)
     
+    # Compute average point spacing from data sample (once, outside loop)
+    sample_size = min(5000, n_points)
+    sample_idx = np.random.choice(n_points, sample_size, replace=False)
+    sample_tree = cKDTree(points[sample_idx])
+    sample_dist, _ = sample_tree.query(points[sample_idx], k=2)
+    avg_spacing = np.mean(sample_dist[:, 1])  # Skip self (distance=0)
+    print(f"  [HALO] avg_spacing: {avg_spacing:.4f}")
+    
     # Process each chunk
     for chunk_idx, chunk in enumerate(chunks):
         chunk_points = chunk['points']
@@ -150,15 +161,14 @@ def estimate_normals_chunked(points: np.ndarray,
             print(f"    Chunk {chunk_idx + 1}/{n_chunks}: {chunk_n:,} points")
         
         # Halo expansion: include neighboring points for accurate boundary normals
-        # Estimate average point spacing
-        avg_spacing = 0.1  # Default, estimate from data if needed
         halo_expand = avg_spacing * 3  # 3x spacing for halo
         
         # Get bounding box of chunk
         chunk_min = chunk_points.min(axis=0)
         chunk_max = chunk_points.max(axis=0)
         
-        # Find halo points from full point cloud
+        # Find halo points from full point cloud (expanded bounding box)
+        # IMPORTANT: halo_indices MUST include all core_indices
         halo_mask = (
             (points[:, 0] >= chunk_min[0] - halo_expand) & (points[:, 0] <= chunk_max[0] + halo_expand) &
             (points[:, 1] >= chunk_min[1] - halo_expand) & (points[:, 1] <= chunk_max[1] + halo_expand) &
@@ -166,62 +176,44 @@ def estimate_normals_chunked(points: np.ndarray,
         )
         halo_indices = np.where(halo_mask)[0]
         
-        # Core points = chunk indices, Halo points = neighbors outside chunk
+        # Extract halo points (includes both core and halo regions)
+        halo_points = points[halo_indices].astype(np.float32)
+        
+        # Find mapping: core positions within halo_points array
         core_mask = np.isin(halo_indices, global_indices)
-        core_in_halo = halo_indices[core_mask]
-        halo_only = halo_indices[~core_mask]
+        core_positions = np.where(core_mask)[0]  # positions of core points in halo array
         
-        # Combined points for KDTree: core + halo
-        combined_points = points[halo_indices]
-        combined_n = len(combined_points)
+        print(f"      [HALO] Core: {len(core_positions):,}, Halo: {len(halo_points):,}")
         
-        # Map: core position in combined array
-        core_combined_idx = np.searchsorted(halo_indices, global_indices)
-        
-        core_n = chunk_n
-        halo_n = len(halo_only)
-        print(f"      [HALO] Core: {core_n:,}, Halo: {halo_n:,}")
-        
-        # Build local cKDTree for combined points (no global KDTree)
+        # Build KDTree on halo points
         t0 = time.time()
-        local_tree = cKDTree(combined_points)
+        local_tree = cKDTree(halo_points)
         kdtime = time.time() - t0
-        print(f"      [CHUNK] Combined: {combined_n:,}, KDTree build: {kdtime:.3f}s")
+        print(f"      [CHUNK] Halo KDTree: {len(halo_points):,}, build: {kdtime:.3f}s")
         
-        # Query neighbors for core points only
-        k_eff = min(k + 1, combined_n)
-        distances, local_indices = local_tree.query(combined_points[core_combined_idx], k=k_eff)
-        
-        # Convert to float32
-        combined_points = combined_points.astype(np.float32)
-        core_points = chunk_points.astype(np.float32)
-        
-        # Move to device
-        if device == 'cuda' and HAS_TORCH:
-            points_gpu = torch.from_numpy(combined_points).cuda()
-            core_gpu = torch.from_numpy(core_points).cuda()
-        elif device == 'mps' and HAS_TORCH:
-            points_gpu = torch.from_numpy(combined_points).to('mps')
-            core_gpu = torch.from_numpy(core_points).to('mps')
-        elif HAS_TORCH:
-            points_gpu = torch.from_numpy(combined_points)
-            core_gpu = torch.from_numpy(core_points)
-        else:
-            points_gpu = combined_points
-            core_gpu = core_points
+        # Query ALL halo points for neighbors
+        k_eff = min(k + 1, len(halo_points))
+        distances, neighbor_indices = local_tree.query(halo_points, k=k_eff)
         
         # GPU PCA computation
         if HAS_TORCH and device != 'cpu':
-            # Get neighbors - indices stay on CPU, move to GPU only once
-            neighbor_indices = torch.from_numpy(local_indices[:, 1:]).long()
+            # Move halo points to GPU
+            if device == 'cuda':
+                halo_gpu = torch.from_numpy(halo_points).cuda()
+            elif device == 'mps':
+                halo_gpu = torch.from_numpy(halo_points).to('mps')
+            else:
+                halo_gpu = torch.from_numpy(halo_points)
+            
+            # Get neighbor indices (skip self at index 0)
+            neighbor_indices = torch.from_numpy(neighbor_indices[:, 1:]).long()
             if device == 'cuda':
                 neighbor_indices = neighbor_indices.cuda()
-                # points_gpu already on GPU from line 164, no need to recuda
             elif device == 'mps':
                 neighbor_indices = neighbor_indices.to('mps')
-                # points_gpu already on MPS from line 166
             
-            neighbors = points_gpu[neighbor_indices]
+            # Get neighbor coordinates
+            neighbors = halo_gpu[neighbor_indices]
             
             # PCA
             centroids = neighbors.mean(dim=1, keepdim=True)
@@ -229,47 +221,51 @@ def estimate_normals_chunked(points: np.ndarray,
             cov = torch.matmul(centered.transpose(1, 2), centered) / (k - 1)
             eigenvalues, eigenvectors = torch.linalg.eigh(cov)
             
-            chunk_normals = eigenvectors[:, :, 0].cpu().numpy()
-            chunk_curvatures = (eigenvalues[:, 0] / (eigenvalues.sum(dim=1) + 1e-10)).cpu().numpy()
+            # Normals for ALL halo points
+            halo_normals = eigenvectors[:, :, 0].cpu().numpy()
+            halo_curvatures = (eigenvalues[:, 0] / (eigenvalues.sum(dim=1) + 1e-10)).cpu().numpy()
             
             # Cleanup
-            del neighbors, centered, cov, eigenvalues, eigenvectors
+            del halo_gpu, neighbors, centered, cov, eigenvalues, eigenvectors
             if device == 'cuda':
                 torch.cuda.empty_cache()
         else:
             # CPU fallback
-            neighbor_indices = local_indices[:, 1:]
-            neighbors = combined_points[neighbor_indices]
+            neighbors = halo_points[neighbor_indices[:, 1:]]
             
             centroids = neighbors.mean(axis=1, keepdims=True)
             centered = neighbors - centroids
             cov = np.einsum('bij,bik->bjk', centered, centered) / (k - 1)
             
-            chunk_normals = np.empty((chunk_n, 3), dtype=np.float32)
-            chunk_curvatures = np.empty(chunk_n, dtype=np.float32)
+            halo_normals = np.empty((len(halo_points), 3), dtype=np.float32)
+            halo_curvatures = np.empty(len(halo_points), dtype=np.float32)
             
-            for i in range(chunk_n):
+            for i in range(len(halo_points)):
                 eigvals, eigvecs = eigh(cov[i])
-                chunk_normals[i] = eigvecs[:, 0].astype(np.float32)
+                halo_normals[i] = eigvecs[:, 0].astype(np.float32)
                 total = eigvals.sum()
-                chunk_curvatures[i] = eigvals[0] / total if total > 0 else 0.0
+                halo_curvatures[i] = eigvals[0] / total if total > 0 else 0.0
+        
+        # Extract core normals using mapping
+        core_normals = halo_normals[core_positions]
+        core_curvatures = halo_curvatures[core_positions]
         
         # Flip normals to point away from origin
-        dot_products = np.sum(chunk_normals * core_points, axis=1)
+        dot_products = np.sum(core_normals * halo_points[core_positions], axis=1)
         flip_mask = dot_products < 0
-        chunk_normals[flip_mask] *= -1
+        core_normals[flip_mask] *= -1
         
         # Normalize
-        norms = np.linalg.norm(chunk_normals, axis=1, keepdims=True)
+        norms = np.linalg.norm(core_normals, axis=1, keepdims=True)
         norms[norms == 0] = 1
-        chunk_normals = chunk_normals / norms
+        core_normals = core_normals / norms
         
         # Store in global arrays
-        normals[global_indices] = chunk_normals
-        curvatures[global_indices] = chunk_curvatures.astype(np.float32)
+        normals[global_indices] = core_normals
+        curvatures[global_indices] = core_curvatures.astype(np.float32)
         
         # Cleanup
-        del chunk_points, local_tree, local_indices
+        del chunk_points, local_tree, neighbor_indices
         gc.collect()
     
     print(f"    Completed {n_chunks} chunks")
@@ -673,16 +669,17 @@ def estimate_normals_knn(points: np.ndarray,
                          k: int = 10,
                          batch_size: int = 100000,
                          workers: int = 1,
-                         use_gpu: bool = True,
-                         use_chunked: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                         use_gpu: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Estimate surface normals using K-Nearest Neighbors.
+    Estimate surface normals using K-Nearest Neighbors (FAST mode).
+    
+    This is the FAST mode - NO chunking, NO halo.
+    Use estimate_normals_chunked() for SPATIAL mode with halo support.
     
     Automatically selects the best available method:
-    1. Chunked GPU - for large datasets (>1M points)
-    2. GPU (PyTorch) - for medium datasets
-    3. Vectorized CPU - fallback
-    4. Legacy loop-based - compatibility
+    1. GPU (PyTorch) - for medium datasets
+    2. Vectorized CPU - fallback
+    3. Legacy loop-based - compatibility
     
     Args:
         points: (N, 3) xyz coordinates
@@ -690,13 +687,14 @@ def estimate_normals_knn(points: np.ndarray,
         batch_size: Points per batch for non-chunked methods
         workers: Number of parallel workers
         use_gpu: Whether to use GPU if available (default: True)
-        use_chunked: Use chunked approach for large datasets (default: True)
         
     Returns:
         Tuple of:
         - normals: (N, 3) surface normals (unit length, float32)
         - curvatures: (N,) curvature values (float32)
     """
+    print(f"[NORMALS] Mode: fast (no chunking, no halo)")
+    
     n_points = points.shape[0]
     
     if n_points < 3:
@@ -704,15 +702,6 @@ def estimate_normals_knn(points: np.ndarray,
     
     # Auto-select best method based on availability
     device = get_device() if use_gpu else 'cpu'
-    
-    # Use chunked approach only for very large datasets (>20M points)
-    # Below this threshold, use the faster GPU method which processes
-    # all points in a single pass with batched processing
-    CHUNK_THRESHOLD = 20_000_000  # Use chunked for > 20M points
-    
-    if use_chunked and n_points >= CHUNK_THRESHOLD and HAS_TORCH:
-        print(f"  Using chunked normal estimation (GPU)")
-        return estimate_normals_chunked(points, k=k, device=device)
     
     # Try GPU first if requested and available
     if use_gpu and device != 'cpu' and HAS_TORCH:

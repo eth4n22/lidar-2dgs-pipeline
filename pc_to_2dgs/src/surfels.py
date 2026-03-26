@@ -293,24 +293,24 @@ def build_surfels(points: np.ndarray,
     
     # Handle colors - normalize to [0, 1]
     if colors.dtype == np.uint8:
-        colors = colors.astype(np.float64) / 255.0
+        colors = colors.astype(np.float32) / 255.0
     elif colors.max() > 1.0:
-        colors = colors.astype(np.float64) / 255.0
+        colors = colors.astype(np.float32) / 255.0
     
     # Default scales if not provided
     if scales is None:
-        scales = np.ones((n, 3), dtype=np.float64) * 0.01
+        scales = np.ones((n, 3), dtype=np.float32) * 0.01
     
-    # Build surfel dictionary
+    # Build surfel dictionary (use float32 throughout to save memory)
     surfels = {
-        "position": points.astype(np.float64),
+        "position": points.astype(np.float32),
         "normal": normals,
         "tangent": tangents,
         "bitangent": bitangents,
-        "opacity": np.ones(n, dtype=np.float64),
-        "scale": scales.astype(np.float64),
+        "opacity": np.ones(n, dtype=np.float32),
+        "scale": scales.astype(np.float32),
         "rotation": rotations,
-        "color": colors.astype(np.float64)
+        "color": colors.astype(np.float32)
     }
     
     return surfels

@@ -86,6 +86,10 @@ class LargePointCloudLoader:
 
         if self.max_points:
             self.total_points = min(self.total_points, self.max_points)
+        
+        # For streaming: keep file handle open and track position
+        self._las_file = None
+        self._las_position = 0  # Track current point index for streaming
 
     def _init_txt_loader(self):
         """Initialize TXT file loader with memory mapping."""
@@ -132,28 +136,26 @@ class LargePointCloudLoader:
             return self._load_chunk_txt(start, end)
 
     def _load_chunk_las(self, start: int, end: int) -> np.ndarray:
-        """Load chunk from LAS/LAZ file."""
+        """Load chunk from LAS/LAZ file.
+        
+        STREAMING: Uses laspy point slicing to read only the needed range.
+        Does NOT load entire file into memory.
+        """
         chunk_size = end - start
         if chunk_size <= 0:
             return np.zeros((0, 3), dtype=np.float32)
 
         try:
-            # Load all points once and cache in memory (more efficient than repeated file reads)
-            if not hasattr(self, '_las_points_cache'):
-                with laspy.open(str(self.filepath)) as f:
-                    # Read all points
-                    points_data = f.read()
-                
-                # Cache xyz coordinates
-                self._las_points_cache = np.column_stack([
-                    np.asarray(points_data.x, dtype=np.float32),
-                    np.asarray(points_data.y, dtype=np.float32),
-                    np.asarray(points_data.z, dtype=np.float32)
+            with laspy.open(str(self.filepath)) as f:
+                # Use point slicing to read only the needed range
+                # This should be more memory-efficient than f.read()
+                points_slice = f.points[start:end]
+                points_chunk = np.column_stack([
+                    np.asarray(points_slice.x, dtype=np.float32),
+                    np.asarray(points_slice.y, dtype=np.float32),
+                    np.asarray(points_slice.z, dtype=np.float32)
                 ])
-                print(f"  Loaded {len(self._las_points_cache)} points into memory for chunked access")
-            
-            # Return requested chunk
-            return self._las_points_cache[start:end]
+            return points_chunk
 
         except Exception as e:
             print(f"Warning: Failed to read LAS chunk [{start}:{end}]: {e}")
