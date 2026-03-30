@@ -292,28 +292,39 @@ def estimate_normals_hybrid(
     print("\n  Counting points in input file...")
     n_points = count_points(input_file)
     
-    # Determine mode - use explicit mode, no auto threshold switching
-    selected_mode = mode
-    if mode == "auto":
-        selected_mode = "fast"  # Default to fast if auto
+    # ===== CENTRALIZED PIPELINE SELECTION =====
+    from src.normals import select_pipeline
     
-    print(f"\n[MODE] Using: {selected_mode}")
-    print(f"[MODE] Dataset size: {n_points:,} points")
+    # Get pipeline selection based on dataset size
+    # If user explicitly specified mode, override the automatic selection
+    if mode != "auto":
+        # User specified explicit mode - use it but still get device from selection
+        pipeline = select_pipeline(n_points, use_halo=(mode == "spatial_streaming"))
+        pipeline['mode'] = mode
+    else:
+        # Use automatic selection based on dataset size
+        pipeline = select_pipeline(n_points, use_halo=False)
     
-    if selected_mode == "fast":
+    print(f"\n[PIPELINE] Points: {n_points:,}")
+    print(f"[PIPELINE] Mode: {pipeline['mode']}")
+    print(f"[PIPELINE] Device: {pipeline['device']}")
+    print(f"[PIPELINE] Chunked: {pipeline['use_chunked']}")
+    print(f"[PIPELINE] {pipeline['description']}")
+    
+    if pipeline['mode'] == "fast":
         return estimate_normals_fast(
             input_file=input_file,
             output_file=output_file,
             k=k,
-            device=device
+            device=pipeline['device']
         )
-    elif selected_mode == "streaming":
+    elif pipeline['mode'] == "streaming":
         return estimate_normals_streaming(
             input_file=input_file,
             output_file=output_file,
             k=k,
             chunk_size=chunk_size,
-            device=device,
+            device=pipeline['device'],
             total_points=n_points
         )
     else:  # spatial_streaming
@@ -322,7 +333,7 @@ def estimate_normals_hybrid(
             output_file=output_file,
             k=k,
             chunk_size=chunk_size,
-            device=device,
+            device=pipeline['device'],
             cleanup=cleanup
         )
 

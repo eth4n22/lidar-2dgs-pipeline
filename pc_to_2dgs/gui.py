@@ -706,29 +706,38 @@ class ConverterGUI:
         try:
             update_stage("Loading...", 10)
             
-            # Mode selection: user checkbox ONLY determines behavior
+            # Force halo setting from user checkbox
             print(f"[GUI] Halo enabled: {use_halo}")
             
-            if use_halo:
-                mode = "spatial_streaming"
-                print(f"[MODE] Using: {mode}")
-            else:
-                mode = "fast"
-                print(f"[MODE] Using: {mode}")
+            # Load data based on mode selection FIRST
+            # We need n_points to make the decision, so use small sample to count
+            import numpy as np
             
-            if mode == "fast":
-                print(f"[LOAD] Fast mode: loading directly")
-                import numpy as np
-                data = np.loadtxt(str(input_file), dtype=np.float32, comments='#', delimiter=None)
-                points = data[:, 0:3]
-                colors = (data[:, 3:6]).astype(np.uint8)
-            else:
-                print(f"[LOAD] Spatial mode: using streaming")
+            # Quick count to get dataset size
+            print(f"[LOAD] Counting points in {input_file.name}...")
+            try:
+                # Try to count lines quickly
+                with open(str(input_file), 'r') as f:
+                    n_points = sum(1 for line in f if line.strip() and not line.startswith('#'))
+            except:
+                n_points = 0
+            
+            # Always use fast loading (loadtxt) for datasets small enough
+            # The pipeline selection will handle routing for very large ones
+            if n_points > 0 and n_points >= 5000000:
+                # Large dataset - use streaming
+                print(f"[LOAD] Large dataset ({n_points:,}), using streaming reader")
                 from src.txt_io import StreamingTXTReader
                 reader = StreamingTXTReader(str(input_file), chunk_size=1000000)
                 point_count = reader.total_points
                 print(f"[LOAD] Total points: {point_count:,}")
                 points, colors = load_xyzrgb_txt(str(input_file))
+            else:
+                # Small dataset - load all at once
+                print(f"[LOAD] Fast mode: loading directly")
+                data = np.loadtxt(str(input_file), dtype=np.float32, comments='#', delimiter=None)
+                points = data[:, 0:3]
+                colors = (data[:, 3:6]).astype(np.uint8)
             
             print(f"[LOAD] Loaded {points.shape[0]} points")
             
@@ -747,18 +756,41 @@ class ConverterGUI:
                 points, _ = voxel_downsample(points, voxel_size)
                 colors = colors[:points.shape[0]]
                 print(f"After voxel downsampling: {points.shape[0]} points")
-                
+            
             update_stage("Computing normals...", 45)
             print("\n[NORMALS]")
-            k_normal = min(knn, max(3, points.shape[0] - 1))
-            print(f"[MODE] Using: {mode} (points={points.shape[0]:,})")
             
-            # Route to correct normals estimation based on mode
-            from src.normals import estimate_normals_knn, estimate_normals_chunked
-            if mode == "spatial_streaming":
-                normals, curvatures = estimate_normals_chunked(points, k=k_normal)
+            # ===== CENTRALIZED PIPELINE SELECTION =====
+            from src.normals import select_pipeline, estimate_normals_knn, estimate_normals_chunked
+            
+            # Get pipeline selection based on dataset size
+            pipeline = select_pipeline(points.shape[0], use_halo=use_halo)
+            
+            # Log the decision
+            print(f"[PIPELINE] Points: {points.shape[0]:,}")
+            print(f"[PIPELINE] Mode: {pipeline['mode']}")
+            print(f"[PIPELINE] Device: {pipeline['device']}")
+            print(f"[PIPELINE] Chunked: {pipeline['use_chunked']}")
+            print(f"[PIPELINE] Halo: {pipeline['use_halo']}")
+            print(f"[PIPELINE] {pipeline['description']}")
+            
+            k_normal = min(knn, max(3, points.shape[0] - 1))
+            
+            # Route to correct normals estimation based on pipeline selection
+            if pipeline['mode'] == 'spatial_streaming' or pipeline['use_chunked']:
+                # Use chunked processing
+                normals, curvatures = estimate_normals_chunked(
+                    points, 
+                    k=k_normal,
+                    device=pipeline['device']
+                )
             else:
-                normals, curvatures = estimate_normals_knn(points, k=k_normal)
+                # Use fast GPU processing
+                normals, curvatures = estimate_normals_knn(
+                    points, 
+                    k=k_normal,
+                    use_gpu=(pipeline['device'] != 'cpu')
+                )
             normals = orient_normals_consistently(points, normals)
             print(f"Estimated {normals.shape[0]} normals")
             

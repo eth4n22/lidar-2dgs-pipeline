@@ -83,8 +83,37 @@ def main() -> int:
 
     # 3. Estimate normals
     print(f"\n[3/5] Estimating normals (K={args.k_neighbors})...")
-    from src.normals import estimate_normals_knn
-    normals, curvatures = estimate_normals_knn(points, k=args.k_neighbors)
+    
+    # ===== CENTRALIZED PIPELINE SELECTION =====
+    from src.normals import select_pipeline, estimate_normals_knn, estimate_normals_chunked
+    
+    # Get pipeline selection based on dataset size
+    pipeline = select_pipeline(len(points), use_halo=False)
+    
+    # Log the decision
+    print(f"[PIPELINE] Points: {len(points):,}")
+    print(f"[PIPELINE] Mode: {pipeline['mode']}")
+    print(f"[PIPELINE] Device: {pipeline['device']}")
+    print(f"[PIPELINE] {pipeline['description']}")
+    
+    # Route to correct normals estimation based on pipeline selection
+    k_normal = min(args.k_neighbors, max(3, len(points) - 1))
+    
+    if pipeline['mode'] == 'spatial_streaming' or pipeline['use_chunked']:
+        # Use chunked processing
+        normals, curvatures = estimate_normals_chunked(
+            points, 
+            k=k_normal,
+            device=pipeline['device']
+        )
+    else:
+        # Use fast GPU processing
+        normals, curvatures = estimate_normals_knn(
+            points, 
+            k=k_normal,
+            use_gpu=(pipeline['device'] != 'cpu')
+        )
+    
     print(f"      Computed {len(normals):,} normals")
 
     # 4. Build surfels

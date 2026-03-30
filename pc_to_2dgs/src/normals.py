@@ -300,6 +300,83 @@ def get_device():
     return 'cpu'
 
 
+# Pipeline selection thresholds (in number of points)
+THRESHOLD_SMALL = 5_000_000    # < 5M: use full GPU
+THRESHOLD_MEDIUM = 20_000_000  # < 20M: use GPU with batching
+THRESHOLD_LARGE = 50_000_000   # < 50M: streaming with CPU KNN + GPU PCA
+# >= 50M: spatial streaming with CPU only (safe mode)
+
+
+def select_pipeline(n_points: int, use_halo: bool = False) -> Dict:
+    """
+    Select the appropriate pipeline mode and device based on dataset size.
+    
+    Decision logic:
+    - SMALL (< 5M):      FAST + FULL GPU (no chunking)
+    - MEDIUM (5M-20M):  FAST + GPU BATCHED
+    - LARGE (20M-50M):  STREAMING + CPU KNN + GPU PCA (no halo)
+    - VERY LARGE (>=50M): SPATIAL STREAMING + CPU SAFE MODE
+    
+    Args:
+        n_points: Total number of points in the dataset
+        use_halo: Whether to enable halo expansion (from GUI checkbox)
+    
+    Returns:
+        Dictionary with:
+        - mode: 'fast', 'streaming', or 'spatial_streaming'
+        - device: 'cuda', 'mps', or 'cpu'
+        - use_chunked: Whether to use chunked processing
+        - use_halo: Whether halo expansion is enabled
+        - description: Human-readable description
+    """
+    result = {
+        'mode': 'fast',
+        'device': 'cpu',
+        'use_chunked': False,
+        'use_halo': use_halo,
+        'description': '',
+    }
+    
+    # Determine device (GPU if available)
+    result['device'] = get_device()
+    
+    # Force CPU if n_points >= LARGE threshold to avoid OOM
+    if n_points >= THRESHOLD_LARGE:
+        result['mode'] = 'spatial_streaming'
+        result['use_chunked'] = True
+        result['use_halo'] = True  # Always use halo for very large
+        result['description'] = f"SPATIAL STREAMING (CPU SAFE MODE, {n_points:,} points)"
+    elif n_points >= THRESHOLD_MEDIUM:
+        result['mode'] = 'streaming'
+        result['use_chunked'] = True
+        result['use_halo'] = False  # No halo for large
+        result['description'] = f"STREAMING (CPU KNN + GPU PCA, {n_points:,} points)"
+    elif n_points >= THRESHOLD_SMALL:
+        result['mode'] = 'fast'
+        result['use_chunked'] = False
+        result['use_halo'] = False
+        result['description'] = f"FAST + GPU BATCHED ({n_points:,} points)"
+    else:
+        # SMALL: use full GPU
+        result['mode'] = 'fast'
+        result['use_chunked'] = False
+        result['use_halo'] = use_halo  # Respect user preference
+        result['description'] = f"FAST + GPU ({n_points:,} points)"
+    
+    # Override if user explicitly requested halo
+    if use_halo:
+        if result['mode'] == 'fast' and n_points < THRESHOLD_SMALL:
+            result['use_halo'] = True
+            result['description'] = f"FAST + GPU + HALO ({n_points:,} points)"
+        elif result['mode'] == 'fast':
+            result['mode'] = 'spatial_streaming'
+            result['use_chunked'] = True
+            result['use_halo'] = True
+            result['description'] = f"SPATIAL STREAMING (USER REQUESTED HALO, {n_points:,} points)"
+    
+    return result
+
+
 def estimate_normals_gpu(points: np.ndarray,
                             k: int = 10,
                             batch_size: int = 500000,
